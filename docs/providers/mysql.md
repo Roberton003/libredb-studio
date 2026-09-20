@@ -912,14 +912,14 @@ A `VIEW` carries neither a row count nor a size: measured, `information_schema.T
 nobody took. `TABLE_ROWS` on a base table is the engine's own estimate, the same nature as
 PostgreSQL's `reltuples`.
 
-**One known defect this surface inherits rather than repairs:** MariaDB reports
+**MariaDB column default normalization (#795):** MariaDB reports
 `COLUMN_DEFAULT` as the DEFAULT EXPRESSION AS WRITTEN where MySQL reports the VALUE, and the two
-disagree in both directions. A nullable MariaDB column with no default reads as having the default
-`NULL`, and the string `NULL` means opposite things on the two servers; less visibly, MariaDB keeps
-the quotes, so `DEFAULT 'abc'` reads back as `'abc'` there and `abc` on MySQL. A repair that
-special-cases only `NULL` therefore leaves every string default wrong by two characters.
-Measured both ways and filed as **#795**, whose comment carries the
-full measurement table and what "done" looks like.
+disagree in both directions. A nullable MariaDB column with no default reads as the string `NULL`
+(unlike MySQL which answers SQL NULL), and string literals arrive with surrounding quotes (`'abc'`).
+`normalizeColumnDefault()` resolves this difference: bare unquoted `NULL` and generated columns
+(detected via `EXTRA`) map to `undefined`, string literals are unquoted and unescaped (`''` and `\'`),
+and expressions or numeric literals pass through as written. MySQL and other wire-compatible
+engines retain their direct evaluated values.
 
 #### `describeObjects()` describes a whole folder in four statements (#789)
 

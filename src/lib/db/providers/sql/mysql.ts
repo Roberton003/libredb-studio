@@ -886,7 +886,8 @@ const OBJECT_COLUMNS_SQL = `
           DATA_TYPE AS data_type,
           IS_NULLABLE AS is_nullable,
           COLUMN_DEFAULT AS column_default,
-          COLUMN_KEY AS column_key
+          COLUMN_KEY AS column_key,
+          EXTRA AS extra
         FROM information_schema.COLUMNS
         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
         ORDER BY ORDINAL_POSITION`;
@@ -1002,7 +1003,8 @@ function bulkDetailSql(spellings: number, bounded: boolean): BulkDetailStatement
           c.DATA_TYPE AS data_type,
           c.IS_NULLABLE AS is_nullable,
           c.COLUMN_DEFAULT AS column_default,
-          c.COLUMN_KEY AS column_key
+          c.COLUMN_KEY AS column_key,
+          c.EXTRA AS extra
         FROM (${target}) d
         JOIN information_schema.COLUMNS c ON c.TABLE_SCHEMA = ? AND c.TABLE_NAME = d.name
         ORDER BY d.name, c.ORDINAL_POSITION`,
@@ -1138,6 +1140,11 @@ const MARIADB_EXTRA_OBJECT_KINDS: readonly ObjectKindSpec[] = [
  * and none of them has a package or a sequence.
  */
 const MARIADB_VERSION = /mariadb/i;
+
+/** Whether a server VERSION() string identifies as MariaDB (#795). */
+export function isMariaDB(version: string | undefined): boolean {
+  return version !== undefined && MARIADB_VERSION.test(version);
+}
 
 /**
  * The kinds a server with this `VERSION()` string has.
@@ -1667,6 +1674,7 @@ interface DetailColumnRow extends RowDataPacket {
   is_nullable: string;
   column_default: string | null;
   column_key: string;
+  extra?: string | null;
 }
 
 /** One referencing column of one foreign key, with the database the reference lands in. */
@@ -1692,6 +1700,48 @@ interface DetailRows {
 }
 
 /**
+ * Normalizes column default values across MySQL and MariaDB dialects (#795).
+ *
+ * MySQL reports evaluated values (e.g. SQL NULL for no default on a nullable column, or 'abc' for DEFAULT 'abc').
+ * MariaDB reports the expression as written (e.g. string 'NULL' for no default on nullable, ''abc'' with quotes,
+ * 'current_timestamp()' for timestamps, and string 'NULL' for generated columns).
+ */
+export function normalizeColumnDefault(
+  rawDefault: string | null | undefined,
+  extra: string | null | undefined,
+  isMaria: boolean,
+): string | undefined {
+  if (rawDefault === null || rawDefault === undefined) {
+    return undefined;
+  }
+
+  // Non-MariaDB servers (MySQL, TiDB, Vitess, SingleStore) pass through evaluated values directly.
+  if (!isMaria) {
+    return rawDefault;
+  }
+
+  // MariaDB: generated columns (STORED or VIRTUAL) return string 'NULL' in COLUMN_DEFAULT, but have no insert default.
+  if (extra !== null && extra !== undefined && /GENERATED/i.test(extra)) {
+    return undefined;
+  }
+
+  // MariaDB: bare unquoted string 'NULL' indicates absence of default on a nullable column.
+  if (rawDefault === "NULL") {
+    return undefined;
+  }
+
+  // MariaDB: single-quoted string literals arrive with surrounding quotes (e.g. ''NULL'', ''abc'', '''', ''it''''s'').
+  if (rawDefault.length >= 2 && rawDefault.startsWith("'") && rawDefault.endsWith("'")) {
+    const unquoted = rawDefault.slice(1, -1);
+    // Unescape SQL standard duplicate quotes ('' -> ') and backslash escapes (\' -> ').
+    return unquoted.replace(/''/g, "'").replace(/\\'/g, "'");
+  }
+
+  // Numbers, booleans, and raw expressions (e.g. current_timestamp(), 42) pass through as written.
+  return rawDefault;
+}
+
+/**
  * Three catalog row sets turned into one `ObjectDetail`, shared by the single and the bulk
  * read.
  *
@@ -1710,13 +1760,18 @@ interface DetailRows {
  * a path. Qualifying the cross-database case is not cosmetic: a bare name there addresses a
  * table in the wrong database, and InnoDB does accept a foreign key into another one.
  */
-function objectDetailFromRows(path: readonly string[], schema: string, rows: DetailRows): ObjectDetail {
+function objectDetailFromRows(
+  path: readonly string[],
+  schema: string,
+  rows: DetailRows,
+  isMaria: boolean = false,
+): ObjectDetail {
   const columns: ColumnSchema[] = rows.columns.map((row) => ({
     name: row.column_name,
     type: row.data_type,
     nullable: row.is_nullable === "YES",
     isPrimary: row.column_key === "PRI",
-    defaultValue: row.column_default ?? undefined,
+    defaultValue: normalizeColumnDefault(row.column_default, row.extra, isMaria),
   }));
 
   const byIndex = new Map<string, IndexSchema>();
@@ -2402,10 +2457,11 @@ export class MySQLProvider extends SQLBaseProvider {
     const binds = [schema, path[path.length - 1]];
     const conn = await this.pool!.getConnection();
     try {
+      const isMaria = isMariaDB(this.measuredServerVersion);
       const columns = await this.runObjectQuery<DetailColumnRow[]>(conn, OBJECT_COLUMNS_SQL, binds);
       const foreignKeys = await this.runObjectQuery<DetailForeignKeyRow[]>(conn, OBJECT_FOREIGN_KEYS_SQL, binds);
       const indexes = await this.runObjectQuery<DetailIndexRow[]>(conn, OBJECT_INDEXES_SQL, binds);
-      return objectDetailFromRows(path, schema, { columns, foreignKeys, indexes });
+      return objectDetailFromRows(path, schema, { columns, foreignKeys, indexes }, isMaria);
     } finally {
       conn.release();
     }
@@ -2489,13 +2545,19 @@ export class MySQLProvider extends SQLBaseProvider {
       );
       const indexes = byObjectName(await this.runObjectQuery<DetailIndexRow[]>(conn, statements.indexes, detailParams));
 
+      const isMaria = isMariaDB(this.measuredServerVersion);
       const details = described
         .map((row) =>
-          objectDetailFromRows(objectPath(container, row), schema, {
-            columns: columns.get(row.name) ?? [],
-            foreignKeys: foreignKeys.get(row.name) ?? [],
-            indexes: indexes.get(row.name) ?? [],
-          }),
+          objectDetailFromRows(
+            objectPath(container, row),
+            schema,
+            {
+              columns: columns.get(row.name) ?? [],
+              foreignKeys: foreignKeys.get(row.name) ?? [],
+              indexes: indexes.get(row.name) ?? [],
+            },
+            isMaria,
+          ),
         )
         .sort((left, right) => comparePaths(left.path, right.path));
       return truncated ? { details, truncated: { limit, reason: callerBoundTruncationReason(limit) } } : { details };

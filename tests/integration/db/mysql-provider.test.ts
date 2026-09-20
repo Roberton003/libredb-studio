@@ -4310,6 +4310,110 @@ describe("MySQL object listing and detail", () => {
     await provider.disconnect();
   });
 
+  test("MariaDB column defaults normalize nullable absence and unquote strings (#795)", async () => {
+    const provider = await connectedTo(true);
+    mockExecuteFn = async (sql: string, params?: unknown[]) => {
+      const normalized = sql.trim().toLowerCase();
+      if (normalized.includes("version()")) {
+        return [[{ version: MARIADB_VERSION_STRING }], []];
+      }
+      if (normalized.includes("information_schema.columns")) {
+        return [
+          [
+            {
+              column_name: "no_def_nullable",
+              data_type: "int",
+              is_nullable: "YES",
+              column_default: "NULL",
+              column_key: "",
+              extra: null,
+            },
+            {
+              column_name: "no_def_not_null",
+              data_type: "int",
+              is_nullable: "NO",
+              column_default: null,
+              column_key: "",
+              extra: null,
+            },
+            {
+              column_name: "def_str_null",
+              data_type: "varchar",
+              is_nullable: "YES",
+              column_default: "'NULL'",
+              column_key: "",
+              extra: null,
+            },
+            {
+              column_name: "def_str_abc",
+              data_type: "varchar",
+              is_nullable: "YES",
+              column_default: "'abc'",
+              column_key: "",
+              extra: null,
+            },
+            {
+              column_name: "def_escaped_quote",
+              data_type: "varchar",
+              is_nullable: "YES",
+              column_default: "'it''s'",
+              column_key: "",
+              extra: null,
+            },
+            {
+              column_name: "def_backslash_quote",
+              data_type: "varchar",
+              is_nullable: "YES",
+              column_default: "'foo\\'bar'",
+              column_key: "",
+              extra: null,
+            },
+            {
+              column_name: "def_num",
+              data_type: "int",
+              is_nullable: "YES",
+              column_default: "42",
+              column_key: "",
+              extra: null,
+            },
+            {
+              column_name: "def_expr",
+              data_type: "timestamp",
+              is_nullable: "YES",
+              column_default: "current_timestamp()",
+              column_key: "",
+              extra: null,
+            },
+            {
+              column_name: "col_generated",
+              data_type: "int",
+              is_nullable: "YES",
+              column_default: "NULL",
+              column_key: "",
+              extra: "STORED GENERATED",
+            },
+          ],
+          [],
+        ];
+      }
+      return [[], []];
+    };
+
+    const detail = await provider.describeObject(["app", "demo"], "table");
+    expect(detail.columns.map((col) => [col.name, col.defaultValue])).toEqual([
+      ["no_def_nullable", undefined],
+      ["no_def_not_null", undefined],
+      ["def_str_null", "NULL"],
+      ["def_str_abc", "abc"],
+      ["def_escaped_quote", "it's"],
+      ["def_backslash_quote", "foo'bar"],
+      ["def_num", "42"],
+      ["def_expr", "current_timestamp()"],
+      ["col_generated", undefined],
+    ]);
+    await provider.disconnect();
+  });
+
   test("a kind with no table behind it describes as three empty lists, without asking the server", async () => {
     // Not an optimisation and not a name test. The three reads key the last path segment
     // against TABLE_NAME, and on MySQL a table and a procedure CAN share a name, so a
