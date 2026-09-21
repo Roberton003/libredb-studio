@@ -106,7 +106,8 @@
     "./styles.css": "./dist/styles.css"
   },
   "bin": {
-    "libredb-studio": "bin/studio.js"
+    "libredb-studio": "bin/studio.js",
+    "libredb-mcp": "bin/libredb-mcp.ts"
   },
   "files": [
     "dist",
@@ -175,6 +176,7 @@
     "@duckdb/node-api": "1.5.5-r.5",
     "@google/generative-ai": "^0.24.1",
     "@libredb/libredb": "^0.2.2",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "@monaco-editor/react": "^4.7.0",
     "@radix-ui/react-accordion": "^1.2.20",
     "@radix-ui/react-alert-dialog": "^1.1.23",
