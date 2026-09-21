@@ -84,6 +84,13 @@ export interface QueryResultEnvelope {
   byte_size: number;
   execution_time_ms: number;
   fields?: Array<{ name: string; type?: string }>;
+  pagination?: {
+    limit: number;
+    offset: number;
+    hasMore: boolean;
+    totalReturned: number;
+    wasLimited: boolean;
+  };
 }
 
 // ============================================================================
@@ -97,4 +104,65 @@ export interface McpServerConfig {
   connectionsProvider?: () => Promise<DatabaseConnection[]> | DatabaseConnection[];
   defaultQueryTimeoutMs?: number;
   maxQueryRowsCeiling?: number;
+}
+
+// ============================================================================
+// Protocolo JSON-RPC 2.0 & MCP
+// ============================================================================
+
+export type JsonRpcId = string | number | null;
+
+export interface JsonRpcRequest {
+  jsonrpc: "2.0";
+  id?: JsonRpcId;
+  method: string;
+  params?: Record<string, unknown>;
+}
+
+export interface JsonRpcError {
+  code: number;
+  message: string;
+  data?: unknown;
+}
+
+export interface JsonRpcResponse {
+  jsonrpc: "2.0";
+  id: JsonRpcId;
+  result?: unknown;
+  error?: JsonRpcError;
+}
+
+export const JSON_RPC_ERRORS = {
+  PARSE_ERROR: -32700,
+  INVALID_REQUEST: -32600,
+  METHOD_NOT_FOUND: -32601,
+  INVALID_PARAMS: -32602,
+  INTERNAL_ERROR: -32603,
+} as const;
+
+export interface McpToolDefinition {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+}
+
+export interface McpToolContent {
+  type: "text";
+  text: string;
+}
+
+export interface McpCallResult {
+  content: McpToolContent[];
+  isError?: boolean;
+}
+
+export interface McpInitializeResult {
+  protocolVersion: string;
+  capabilities: {
+    tools: { listChanged: boolean };
+  };
+  serverInfo: {
+    name: string;
+    version: string;
+  };
 }

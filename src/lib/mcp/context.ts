@@ -1,6 +1,6 @@
 import type { DatabaseConnection } from "@/lib/types";
 import type { DatabaseProvider } from "@/lib/db/types";
-import { createDatabaseProvider } from "@/lib/db/factory";
+import { acquireExecutionProfileProvider, createDatabaseProvider, type ExecutionProfile } from "@/lib/db/factory";
 import type { PublicConnectionMetadata } from "./types";
 import { logger } from "@/lib/logger";
 
@@ -50,7 +50,7 @@ export class McpConnectionContext {
         name: conn.name,
         engine: conn.type,
         database: conn.database,
-        read_only: conn.environment === "production",
+        read_only: conn.environment === "production" || (conn as any).readOnly === true,
         environment: conn.environment,
       });
     }
@@ -66,9 +66,20 @@ export class McpConnectionContext {
 
   /**
    * Obtém ou inicializa com conexão real uma instância de provider.
-   * Utiliza padrão Single-Flight para evitar abertura de pools duplicados em requisições concorrentes.
+   * Se um ExecutionProfile for passado, utiliza diretamente a barreira canônica
+   * acquireExecutionProfileProvider (factory.ts:781).
+   * Caso contrário, utiliza o cache local com single-flight.
    */
-  public async getProvider(connectionId: string): Promise<DatabaseProvider> {
+  public async getProvider(connectionId: string, profile?: ExecutionProfile): Promise<DatabaseProvider> {
+    const connection = this.connections.get(connectionId);
+    if (!connection) {
+      throw new Error(`Connection not found: "${connectionId}"`);
+    }
+
+    if (profile) {
+      return acquireExecutionProfileProvider(connection, profile);
+    }
+
     const cached = this.activeProviders.get(connectionId);
     if (cached) {
       if (!cached.isConnected || cached.isConnected()) {
@@ -84,11 +95,6 @@ export class McpConnectionContext {
       return pending;
     }
 
-    const connection = this.connections.get(connectionId);
-    if (!connection) {
-      throw new Error(`Connection not found: "${connectionId}"`);
-    }
-
     const targetVersion = this.connectionVersions.get(connectionId) || 0;
 
     const initPromise = (async () => {
@@ -99,19 +105,18 @@ export class McpConnectionContext {
           await provider.connect();
         }
 
-        // Se a versão mudou durante a inicialização (ex: registerConnection concorrente), descarta o provider obsoleto
+        // Verificação defensiva de corrida: se a conexão foi re-registrada enquanto
+        // estávamos conectando, descarta este provider imediatamente para evitar zumbis
         const currentVersion = this.connectionVersions.get(connectionId) || 0;
-        if (currentVersion === targetVersion) {
-          this.activeProviders.set(connectionId, provider);
-        } else {
-          provider.disconnect?.().catch(() => {});
+        if (currentVersion !== targetVersion) {
+          if (typeof provider.disconnect === "function") {
+            provider.disconnect().catch(() => {});
+          }
+          throw new Error(`Connection "${connectionId}" was invalidated during initialization`);
         }
 
+        this.activeProviders.set(connectionId, provider);
         return provider;
-      } catch (error) {
-        this.activeProviders.delete(connectionId);
-        logger.error("Failed to instantiate or connect database provider for MCP", { connectionId, error });
-        throw error;
       } finally {
         this.pendingProviders.delete(connectionId);
       }
@@ -122,19 +127,28 @@ export class McpConnectionContext {
   }
 
   /**
-   * Encerra todos os providers ativos e drena recursos.
+   * Encerra todos os providers ativos gerenciados localmente.
    */
-  public async closeAll(): Promise<void> {
-    const providers = Array.from(this.activeProviders.entries());
-    this.activeProviders.clear();
-    this.pendingProviders.clear();
-
-    for (const [id, provider] of providers) {
-      try {
-        await provider.disconnect?.();
-      } catch (err) {
-        logger.warn("Error disconnecting provider during MCP shutdown", { id, err });
+  public async disconnectAll(): Promise<void> {
+    const disconnectPromises: Promise<void>[] = [];
+    for (const [id, provider] of this.activeProviders.entries()) {
+      if (typeof provider.disconnect === "function") {
+        disconnectPromises.push(
+          provider.disconnect().catch((err) => {
+            logger.warn(`Error disconnecting provider during MCP shutdown`, { id, err });
+          }),
+        );
       }
     }
+    this.activeProviders.clear();
+    this.pendingProviders.clear();
+    await Promise.all(disconnectPromises);
+  }
+
+  /**
+   * Alias de conveniência para disconnectAll.
+   */
+  public async closeAll(): Promise<void> {
+    return this.disconnectAll();
   }
 }
