@@ -11,7 +11,7 @@ export interface McpRequestContext {
   signal?: AbortSignal;
 }
 
-export const MCP_TOOLS_DEFINITIONS: McpToolDefinition[] = [
+const MCP_TOOLS_DEFINITIONS: McpToolDefinition[] = [
   {
     name: "list_connections",
     description: "Lista todas as conexões de banco de dados disponíveis no LibreDB Studio (sem expor credenciais)",

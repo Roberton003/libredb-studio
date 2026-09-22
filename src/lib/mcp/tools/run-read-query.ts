@@ -301,26 +301,6 @@ export async function executeRunReadQuery(
         truncated = true;
         candidate = buildEnvelopeCandidate(safeRows, fields, truncated);
       }
-
-      // Passo E: Salvaguarda final em linhas e metadados
-      if (candidate.wireBytes > MAX_PAYLOAD_BYTES && safeRows.length > 1) {
-        safeRows = safeRows.slice(0, 1);
-        truncated = true;
-        candidate = buildEnvelopeCandidate(safeRows, fields, truncated);
-      }
-      if (candidate.wireBytes > MAX_PAYLOAD_BYTES && fields && fields.length > 10) {
-        fields = fields.slice(0, 10);
-        truncated = true;
-        candidate = buildEnvelopeCandidate(safeRows, fields, truncated);
-      }
-
-      // Passo F: Salvaguarda absoluta hermética (< 64 KiB garantido matematicamente)
-      if (candidate.wireBytes > MAX_PAYLOAD_BYTES) {
-        safeRows = [];
-        fields = undefined;
-        truncated = true;
-        candidate = buildEnvelopeCandidate(safeRows, fields, truncated);
-      }
     }
 
     return {

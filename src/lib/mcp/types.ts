@@ -155,14 +155,3 @@ export interface McpCallResult {
   content: McpToolContent[];
   isError?: boolean;
 }
-
-export interface McpInitializeResult {
-  protocolVersion: string;
-  capabilities: {
-    tools: { listChanged: boolean };
-  };
-  serverInfo: {
-    name: string;
-    version: string;
-  };
-}

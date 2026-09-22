@@ -1,6 +1,6 @@
 import { inspectAgentStatement, type AgentStatementViolation } from "@/lib/db/operations/statement-guard";
 
-export class McpSecurityViolationError extends Error {
+class McpSecurityViolationError extends Error {
   public readonly code: AgentStatementViolation;
 
   constructor(code: AgentStatementViolation, details?: string) {

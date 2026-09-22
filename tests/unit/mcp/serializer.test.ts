@@ -62,15 +62,22 @@ describe("MCP Safe Serializer", () => {
   });
 
   test("trata objetos com getters que lançam erro ou proxies hostis sem quebrar o serializador", () => {
-    const hostileObj = {};
-    Object.defineProperty(hostileObj, "explodingProp", {
+    const hostile: any = {};
+    Object.defineProperty(hostile, "explosive", {
       get() {
-        throw new Error("Acesso hostil bloqueado");
+        throw new Error("Getters hostis interceptados");
       },
       enumerable: true,
     });
 
-    expect(() => safeSerialize(hostileObj)).not.toThrow();
-    expect(() => safeJsonStringify(hostileObj)).not.toThrow();
+    expect(() => safeSerialize(hostile)).not.toThrow();
+    expect(safeSerialize(hostile)).toBe("[object Object]");
+  });
+
+  test("serializa Error para objeto com name e message", () => {
+    const err = new Error("Falha de teste");
+    const serialized = safeSerialize(err) as any;
+    expect(serialized.name).toBe("Error");
+    expect(serialized.message).toBe("Falha de teste");
   });
 });

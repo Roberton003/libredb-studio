@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, mock, test } from "bun:test";
 import { createMockRequest, parseResponseJSON } from "../../helpers/mock-next";
 
 let mockSessionResult: { role: string; username: string } | null = { role: "admin", username: "admin" };
+let mockGetManagedConnectionsThrow = false;
 
 const authModule = "@/lib/auth";
 mock.module(authModule, () => ({
@@ -9,30 +10,37 @@ mock.module(authModule, () => ({
 }));
 
 mock.module("@/lib/seed", () => ({
-  getManagedConnections: mock(async () => [
-    {
-      id: "demo-pg",
-      name: "Demo Postgres",
-      type: "postgres",
-      database: "demo_db",
-      environment: "production",
-    },
-    {
-      id: "demo-sqlite",
-      name: "Demo SQLite",
-      type: "sqlite",
-      database: ":memory:",
-      environment: "local",
-    },
-  ]),
+  getManagedConnections: mock(async () => {
+    if (mockGetManagedConnectionsThrow) {
+      throw new Error("Simulated managed connections failure");
+    }
+    return [
+      {
+        id: "demo-pg",
+        name: "Demo Postgres",
+        type: "postgres",
+        database: "demo_db",
+        environment: "production",
+      },
+      {
+        id: "demo-sqlite",
+        name: "Demo SQLite",
+        type: "sqlite",
+        database: ":memory:",
+        environment: "local",
+      },
+    ];
+  }),
 }));
 
 import { GET, POST } from "@/app/api/mcp/route";
 import { McpConnectionContext } from "@/lib/mcp/context";
+import { McpDispatcher } from "@/lib/mcp/dispatcher";
 
 describe("MCP Next.js Route Integration (/api/mcp)", () => {
   beforeEach(async () => {
     mockSessionResult = { role: "admin", username: "admin" };
+    mockGetManagedConnectionsThrow = false;
     await McpConnectionContext.resetGlobalCache();
   });
 
@@ -308,5 +316,55 @@ describe("MCP Next.js Route Integration (/api/mcp)", () => {
     const body1 = await parseResponseJSON<any>(response1);
     expect(body1.result.isError).toBe(true);
     expect(body1.result.content[0].text).toContain("cancelled");
+  });
+
+  test("POST /api/mcp responde 400 ao receber JSON inválido ou malformado", async () => {
+    const brokenReq = {
+      method: "POST",
+      headers: new Headers(),
+      json: async () => {
+        throw new Error("Unexpected token at position 0");
+      },
+    };
+    const response = await POST(brokenReq as any);
+    expect(response.status).toBe(400);
+    const body = await parseResponseJSON<any>(response);
+    expect(body.error).toBeDefined();
+    expect(body.error.code).toBe(-32700);
+    expect(body.error.message).toContain("Parse error");
+  });
+
+  test("POST /api/mcp captura erro em getManagedConnections e segue com conexões vazias", async () => {
+    mockGetManagedConnectionsThrow = true;
+    const req = createMockRequest("/api/mcp", {
+      method: "POST",
+      body: { jsonrpc: "2.0", id: "ping-fallback", method: "ping" },
+    });
+    const response = await POST(req as any);
+    expect(response.status).toBe(200);
+    const body = await parseResponseJSON<any>(response);
+    expect(body.id).toBe("ping-fallback");
+  });
+
+  test("POST /api/mcp responde 500 ao ocorrer erro não tratado no dispatcher", async () => {
+    const originalHandle = McpDispatcher.prototype.handle;
+    McpDispatcher.prototype.handle = async () => {
+      throw new Error("Dispatcher fatal explosion");
+    };
+
+    try {
+      const req = createMockRequest("/api/mcp", {
+        method: "POST",
+        body: { jsonrpc: "2.0", id: "crash-1", method: "ping" },
+      });
+      const response = await POST(req as any);
+      expect(response.status).toBe(500);
+      const body = await parseResponseJSON<any>(response);
+      expect(body.error).toBeDefined();
+      expect(body.error.code).toBe(-32603);
+      expect(body.error.message).toBe("Dispatcher fatal explosion");
+    } finally {
+      McpDispatcher.prototype.handle = originalHandle;
+    }
   });
 });
