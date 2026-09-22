@@ -76,4 +76,41 @@ describe("MCP Progressive Budget Compression (64 KiB Defensivo)", () => {
     expect(envelope.row_count).toBe(10);
     expect(envelope.rows.length).toBe(10);
   });
+
+  test("respeita o teto de 64 KiB mesmo com nomes de colunas gigantescos e chaves patológicas", async () => {
+    // 5 colunas com nomes de 50.000 caracteres cada
+    const giantColName = "col_".repeat(12500);
+    const fields = [giantColName];
+    const rows = [{ [giantColName]: "short-val" }];
+    const ctx = createMockContext(rows, fields);
+
+    const result = await executeRunReadQuery({ connection_id: "test-conn", sql: "SELECT * FROM giant_cols" }, ctx);
+
+    expect(result.isError).toBeFalsy();
+    const text = result.content[0].text;
+    const envelope = JSON.parse(text);
+
+    const wireBytes = Buffer.byteLength(text, "utf-8");
+    expect(wireBytes).toBeLessThanOrEqual(64 * 1024);
+    expect(envelope.byte_size).toBe(wireBytes);
+    expect(envelope.truncated).toBe(true);
+  });
+
+  test("garante concordância exata entre envelope.byte_size e os bytes reais serializados no fio (sem subcontagem)", async () => {
+    const rows = Array.from({ length: 50 }, (_, i) => ({
+      id: i,
+      name: `Entity ${i}`,
+      description: `Description text for entity ${i} with some variable padding: ${"#".repeat(i * 10)}`,
+    }));
+    const ctx = createMockContext(rows, ["id", "name", "description"]);
+
+    const result = await executeRunReadQuery({ connection_id: "test-conn", sql: "SELECT * FROM entities" }, ctx);
+
+    expect(result.isError).toBeFalsy();
+    const text = result.content[0].text;
+    const envelope = JSON.parse(text);
+
+    const wireBytes = Buffer.byteLength(text, "utf-8");
+    expect(envelope.byte_size).toBe(wireBytes);
+  });
 });

@@ -35,6 +35,16 @@ export class McpCancellationManager {
   }
 
   /**
+   * Registra um alias para uma query existente, compartilhando o mesmo AbortController
+   */
+  public registerAlias(aliasId: string | number, primaryId: string | number): void {
+    const primary = this.activeQueries.get(primaryId);
+    if (primary) {
+      this.activeQueries.set(aliasId, primary);
+    }
+  }
+
+  /**
    * Finaliza o registro de uma operação que concluiu
    */
   public deregister(requestId: string | number): void {

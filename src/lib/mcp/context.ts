@@ -6,10 +6,14 @@ import { logger } from "@/lib/logger";
 
 export class McpConnectionContext {
   private connections = new Map<string, DatabaseConnection>();
-  private activeProviders = new Map<string, DatabaseProvider>();
-  private pendingProviders = new Map<string, Promise<DatabaseProvider>>();
+  private static activeProviders = new Map<string, DatabaseProvider>();
+  private static pendingProviders = new Map<string, Promise<DatabaseProvider>>();
+  private static connectionVersions = new Map<string, number>();
+  private static registeredConnectionsJson = new Map<string, string>();
 
-  private connectionVersions = new Map<string, number>();
+  private static getCacheKey(connectionId: string, profile?: ExecutionProfile): string {
+    return JSON.stringify([connectionId, profile ?? null]);
+  }
 
   constructor(initialConnections: DatabaseConnection[] = []) {
     for (const conn of initialConnections) {
@@ -19,24 +23,52 @@ export class McpConnectionContext {
 
   /**
    * Registra ou atualiza uma conexão disponível internamente.
-   * Incrementa a versão para invalidar promessas de inicialização concorrentes em andamento.
+   * Se a configuração da conexão for idêntica à já registrada, preserva os providers ativos.
+   * Se a configuração foi alterada, invalida os providers cacheados e incrementa a versão.
    */
   public registerConnection(connection: DatabaseConnection): void {
-    const version = (this.connectionVersions.get(connection.id) || 0) + 1;
-    this.connectionVersions.set(connection.id, version);
-
-    for (const [key, provider] of this.activeProviders.entries()) {
-      if (key === connection.id || key.startsWith(`${connection.id}:`)) {
-        provider.disconnect?.().catch(() => {});
-        this.activeProviders.delete(key);
-      }
-    }
-    for (const key of this.pendingProviders.keys()) {
-      if (key === connection.id || key.startsWith(`${connection.id}:`)) {
-        this.pendingProviders.delete(key);
-      }
-    }
     this.connections.set(connection.id, connection);
+
+    const serialized = JSON.stringify(connection);
+    const prevSerialized = McpConnectionContext.registeredConnectionsJson.get(connection.id);
+    if (prevSerialized === serialized) {
+      return;
+    }
+
+    McpConnectionContext.registeredConnectionsJson.set(connection.id, serialized);
+
+    // Invalida providers somente se a conexão já existia anteriormente com outra configuração
+    if (prevSerialized !== undefined) {
+      const version = (McpConnectionContext.connectionVersions.get(connection.id) || 0) + 1;
+      McpConnectionContext.connectionVersions.set(connection.id, version);
+
+      for (const [key, provider] of McpConnectionContext.activeProviders.entries()) {
+        try {
+          const [connId] = JSON.parse(key);
+          if (connId === connection.id) {
+            provider.disconnect?.().catch(() => {});
+            McpConnectionContext.activeProviders.delete(key);
+          }
+        } catch {
+          if (key.includes(connection.id)) {
+            provider.disconnect?.().catch(() => {});
+            McpConnectionContext.activeProviders.delete(key);
+          }
+        }
+      }
+      for (const key of McpConnectionContext.pendingProviders.keys()) {
+        try {
+          const [connId] = JSON.parse(key);
+          if (connId === connection.id) {
+            McpConnectionContext.pendingProviders.delete(key);
+          }
+        } catch {
+          if (key.includes(connection.id)) {
+            McpConnectionContext.pendingProviders.delete(key);
+          }
+        }
+      }
+    }
   }
 
   /**
@@ -71,8 +103,8 @@ export class McpConnectionContext {
 
   /**
    * Obtém ou inicializa com conexão real uma instância de provider.
-   * Suporta ExecutionProfile com single-flight mutex chaveado por connectionId:profile,
-   * evitando instanciação duplicada durante rajadas concorrentes.
+   * Suporta ExecutionProfile com single-flight mutex estático chaveado sem colisão,
+   * garantindo unicidade mesmo entre múltiplos McpConnectionContext instanciados por requisições HTTP distintas.
    */
   public async getProvider(connectionId: string, profile?: ExecutionProfile): Promise<DatabaseProvider> {
     const connection = this.connections.get(connectionId);
@@ -80,24 +112,24 @@ export class McpConnectionContext {
       throw new Error(`Connection not found: "${connectionId}"`);
     }
 
-    const cacheKey = profile ? `${connectionId}:${profile}` : connectionId;
+    const cacheKey = McpConnectionContext.getCacheKey(connectionId, profile);
 
-    const cached = this.activeProviders.get(cacheKey);
+    const cached = McpConnectionContext.activeProviders.get(cacheKey);
     if (cached) {
       if (!cached.isConnected || cached.isConnected()) {
         return cached;
       }
       // Se estava desconectado, limpa e reconecta
-      this.activeProviders.delete(cacheKey);
+      McpConnectionContext.activeProviders.delete(cacheKey);
     }
 
     // Se já existe uma inicialização em andamento para este cacheKey, reutiliza a Promise (Single-Flight)
-    const pending = this.pendingProviders.get(cacheKey);
+    const pending = McpConnectionContext.pendingProviders.get(cacheKey);
     if (pending) {
       return pending;
     }
 
-    const targetVersion = this.connectionVersions.get(connectionId) || 0;
+    const targetVersion = McpConnectionContext.connectionVersions.get(connectionId) || 0;
 
     const initPromise = (async () => {
       try {
@@ -114,7 +146,7 @@ export class McpConnectionContext {
 
         // Verificação defensiva de corrida: se a conexão foi re-registrada enquanto
         // estávamos conectando, descarta este provider imediatamente para evitar zumbis
-        const currentVersion = this.connectionVersions.get(connectionId) || 0;
+        const currentVersion = McpConnectionContext.connectionVersions.get(connectionId) || 0;
         if (currentVersion !== targetVersion) {
           if (typeof provider.disconnect === "function") {
             provider.disconnect().catch(() => {});
@@ -122,34 +154,50 @@ export class McpConnectionContext {
           throw new Error(`Connection "${connectionId}" was invalidated during initialization`);
         }
 
-        this.activeProviders.set(cacheKey, provider);
+        McpConnectionContext.activeProviders.set(cacheKey, provider);
         return provider;
       } finally {
-        this.pendingProviders.delete(cacheKey);
+        McpConnectionContext.pendingProviders.delete(cacheKey);
       }
     })();
 
-    this.pendingProviders.set(cacheKey, initPromise);
+    McpConnectionContext.pendingProviders.set(cacheKey, initPromise);
     return initPromise;
   }
 
   /**
-   * Encerra todos os providers ativos gerenciados localmente.
+   * Encerra todos os providers ativos gerenciados globalmente.
    */
   public async disconnectAll(): Promise<void> {
     const disconnectPromises: Promise<void>[] = [];
-    for (const [id, provider] of this.activeProviders.entries()) {
+    for (const [key, provider] of McpConnectionContext.activeProviders.entries()) {
       if (typeof provider.disconnect === "function") {
         disconnectPromises.push(
           provider.disconnect().catch((err) => {
-            logger.warn(`Error disconnecting provider during MCP shutdown`, { id, err });
+            logger.warn(`Error disconnecting provider during MCP shutdown`, { key, err });
           }),
         );
       }
     }
-    this.activeProviders.clear();
-    this.pendingProviders.clear();
+    McpConnectionContext.activeProviders.clear();
+    McpConnectionContext.pendingProviders.clear();
     await Promise.all(disconnectPromises);
+  }
+
+  public static setCachedProvider(
+    connectionId: string,
+    profile: ExecutionProfile | undefined,
+    provider: DatabaseProvider,
+  ): void {
+    const key = McpConnectionContext.getCacheKey(connectionId, profile);
+    McpConnectionContext.activeProviders.set(key, provider);
+  }
+
+  public static async resetGlobalCache(): Promise<void> {
+    McpConnectionContext.activeProviders.clear();
+    McpConnectionContext.pendingProviders.clear();
+    McpConnectionContext.connectionVersions.clear();
+    McpConnectionContext.registeredConnectionsJson.clear();
   }
 
   /**

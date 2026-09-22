@@ -50,6 +50,9 @@ export async function GET() {
   });
 }
 
+// Gerenciador de cancelamento global compartilhado entre requisições HTTP da rota
+const globalMcpCancellationManager = new McpCancellationManager();
+
 /**
  * POST /api/mcp
  * Manipulador JSON-RPC 2.0 oficial para clientes MCP (Cursor, Claude Code, etc).
@@ -98,15 +101,14 @@ export async function POST(req: NextRequest) {
     connections = [];
   }
 
-  // 4. Instanciação do Contexto e Dispatcher MCP com gerenciamento de ciclo de vida e cancelamento
-  const cancellationManager = new McpCancellationManager();
+  // 4. Instanciação do Contexto e Dispatcher MCP com gerenciamento de ciclo de vida e cancelamento cross-request
   const context = new McpConnectionContext(connections);
-  const dispatcher = new McpDispatcher(context, cancellationManager);
+  const dispatcher = new McpDispatcher(context, globalMcpCancellationManager);
 
   try {
     const result = await dispatcher.handle(body, {
       signal: req.signal,
-      cancellationManager,
+      cancellationManager: globalMcpCancellationManager,
     });
 
     if (result === null) {
@@ -128,7 +130,5 @@ export async function POST(req: NextRequest) {
       },
       { status: 500 },
     );
-  } finally {
-    await context.disconnectAll();
   }
 }

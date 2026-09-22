@@ -171,6 +171,7 @@ export class McpDispatcher {
           const manager = this.cancellationManager || requestContext?.cancellationManager;
           if (manager && (typeof reqId === "string" || typeof reqId === "number")) {
             await manager.handleCancellation(String(reqId), cancelParams?.reason);
+            await manager.handleCancellation(`mcp_${reqId}`, cancelParams?.reason);
           }
           return null;
         }

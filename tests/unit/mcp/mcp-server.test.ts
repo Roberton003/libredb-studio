@@ -102,4 +102,50 @@ describe("MCP Server & Context Unit Tests", () => {
 
     await context.disconnectAll();
   });
+
+  test("mantém single-flight compartilhado através de múltiplas instâncias McpConnectionContext (escopo HTTP)", async () => {
+    const conn = {
+      id: "http-race-conn",
+      name: "HTTP Race SQLite",
+      type: "sqlite" as const,
+      database: "seed-assets/sqlite/employee.db",
+      createdAt: new Date(),
+    };
+
+    // Simula 15 requisições HTTP paralelas, cada uma instanciando seu próprio McpConnectionContext
+    const contexts = Array.from({ length: 15 }, () => new McpConnectionContext([conn]));
+
+    const results = await Promise.all(contexts.map((ctx) => ctx.getProvider("http-race-conn", "agent-read-only")));
+
+    expect(results.length).toBe(15);
+    const uniqueInstances = new Set(results);
+    expect(uniqueInstances.size).toBe(1);
+
+    await contexts[0].disconnectAll();
+  });
+
+  test("garante imunidade a colisões de chave entre 'id' com profile e 'id:profile' sem profile", async () => {
+    const conn1 = {
+      id: "col-test",
+      name: "Conn 1",
+      type: "sqlite" as const,
+      database: "seed-assets/sqlite/employee.db",
+      createdAt: new Date(),
+    };
+    const conn2 = {
+      id: "col-test:agent-read-only",
+      name: "Conn 2 with compound id",
+      type: "sqlite" as const,
+      database: ":memory:",
+      createdAt: new Date(),
+    };
+
+    const ctx = new McpConnectionContext([conn1, conn2]);
+
+    const p1 = await ctx.getProvider("col-test", "agent-read-only");
+    const p2 = await ctx.getProvider("col-test:agent-read-only");
+
+    expect(p1).not.toBe(p2);
+    await ctx.disconnectAll();
+  });
 });

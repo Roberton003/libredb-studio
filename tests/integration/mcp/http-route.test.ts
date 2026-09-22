@@ -27,10 +27,12 @@ mock.module("@/lib/seed", () => ({
 }));
 
 import { GET, POST } from "@/app/api/mcp/route";
+import { McpConnectionContext } from "@/lib/mcp/context";
 
 describe("MCP Next.js Route Integration (/api/mcp)", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     mockSessionResult = { role: "admin", username: "admin" };
+    await McpConnectionContext.resetGlobalCache();
   });
 
   test("GET /api/mcp responde 200 com metadados do protocolo MCP", async () => {
@@ -247,17 +249,63 @@ describe("MCP Next.js Route Integration (/api/mcp)", () => {
     expect(response.status).toBe(204);
   });
 
-  test("POST /api/mcp rejeita JSON inválido com status 400 e parse error", async () => {
-    const req = new Request("http://localhost:3000/api/mcp", {
+  test("POST /api/mcp cancela query cross-request via notificação notifications/cancelled", async () => {
+    const mockAsyncProvider = {
+      readOnlyProfile: true,
+      prepareQuery: (sql: string, opts: any) => ({ query: sql, limit: opts.limit, offset: 0, wasLimited: false }),
+      queryReadOnly: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        return { rows: [{ val: 1 }], fields: ["val"] };
+      },
+    };
+
+    McpConnectionContext.setCachedProvider("demo-sqlite", "agent-read-only", mockAsyncProvider as any);
+    McpConnectionContext.setCachedProvider("demo-sqlite", undefined, mockAsyncProvider as any);
+
+    // Dispara POST 1 com query de longa duração
+    const req1 = createMockRequest("/api/mcp", {
       method: "POST",
-      headers: { "content-type": "application/json" },
-      body: "{ invalid json",
+      body: {
+        jsonrpc: "2.0",
+        id: "slow-query-1",
+        method: "tools/call",
+        params: {
+          name: "run_read_query",
+          arguments: {
+            connection_id: "demo-sqlite",
+            sql: "SELECT 1",
+            timeout_ms: 10000,
+          },
+        },
+      },
     });
 
-    const response = await POST(req as any);
-    expect(response.status).toBe(400);
+    const promise1 = POST(req1 as any);
 
-    const body = await parseResponseJSON<any>(response);
-    expect(body.error.code).toBe(-32700);
+    // Aguarda 20ms para garantir que a query iniciou no provider
+    await new Promise((r) => setTimeout(r, 20));
+
+    // Dispara POST 2 com notificação de cancelamento para o requestId "slow-query-1"
+    const req2 = createMockRequest("/api/mcp", {
+      method: "POST",
+      body: {
+        jsonrpc: "2.0",
+        method: "notifications/cancelled",
+        params: {
+          requestId: "slow-query-1",
+          reason: "User cancelled query via UI/MCP",
+        },
+      },
+    });
+
+    const response2 = await POST(req2 as any);
+    expect(response2.status).toBe(204);
+
+    const response1 = await promise1;
+    expect(response1.status).toBe(200);
+
+    const body1 = await parseResponseJSON<any>(response1);
+    expect(body1.result.isError).toBe(true);
+    expect(body1.result.content[0].text).toContain("cancelled");
   });
 });

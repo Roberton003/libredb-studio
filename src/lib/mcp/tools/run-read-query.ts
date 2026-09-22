@@ -57,7 +57,8 @@ export async function executeRunReadQuery(
     };
   }
 
-  const queryId = `mcp_${opts?.requestId !== undefined && opts?.requestId !== null ? String(opts.requestId) : crypto.randomUUID()}`;
+  const rawReqId = opts?.requestId !== undefined && opts?.requestId !== null ? String(opts.requestId) : null;
+  const queryId = `mcp_${rawReqId ?? crypto.randomUUID()}`;
   let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
 
   try {
@@ -65,16 +66,17 @@ export async function executeRunReadQuery(
     assertReadOnlyStatement(args.sql);
 
     // 2. Barreira Canônica: acquireExecutionProfileProvider com perfil "agent-read-only"
+    const connConfig =
+      typeof context.getConnection === "function" ? context.getConnection(args.connection_id) : undefined;
+    const isMemoryTarget =
+      connConfig?.type === "sqlite" && (!connConfig.database || connConfig.database === ":memory:");
+
     let provider: any;
     try {
       provider = await context.getProvider(args.connection_id, "agent-read-only");
     } catch (err: any) {
-      // Bancos em memória (:memory:) não admitem handle somente-leitura em SO (#328)
-      if (
-        err?.reasonCode === "PROFILE_UNSUPPORTED_TARGET" ||
-        err?.message?.toLowerCase().includes("in-memory") ||
-        err?.message?.includes(":memory:")
-      ) {
+      // Apenas conexões comprovadamente SQLite em memória (:memory:) que reportam incompatibilidade tipada usam fallback (#328)
+      if (isMemoryTarget && err?.reasonCode === "PROFILE_UNSUPPORTED_TARGET") {
         provider = await context.getProvider(args.connection_id);
       } else {
         throw err;
@@ -96,20 +98,27 @@ export async function executeRunReadQuery(
 
     const startTime = Date.now();
 
-    // Registrar no cancellationManager se disponível
+    // Registrar no cancellationManager se disponível (mapeando queryId e rawReqId para resolução cruzada)
+    let cancelSignal: AbortSignal | undefined;
     if (cancellationManager) {
       const cancelDatabaseOperation = async () => {
         if (provider && typeof (provider as any).cancelQuery === "function") {
           await (provider as any).cancelQuery(queryId);
         }
       };
-      cancellationManager.register(queryId, args.connection_id, cancelDatabaseOperation);
+      cancelSignal = cancellationManager.register(queryId, args.connection_id, cancelDatabaseOperation);
+      if (rawReqId && rawReqId !== queryId) {
+        cancellationManager.registerAlias(rawReqId, queryId);
+      }
 
       if (signal) {
         signal.addEventListener(
           "abort",
           () => {
             cancellationManager.handleCancellation(queryId, signal.reason);
+            if (rawReqId) {
+              cancellationManager.handleCancellation(rawReqId, signal.reason);
+            }
           },
           { once: true },
         );
@@ -122,16 +131,31 @@ export async function executeRunReadQuery(
         ? provider.prepareQuery(args.sql, { limit: args.max_rows })
         : { query: args.sql, limit: args.max_rows, offset: 0, wasLimited: false };
 
-    // 4. Execução protegida com timeout limpo
+    // 4. Execução protegida com timeout e promessa de cancelamento imediato (Fail-Fast)
     let rawResult: any;
 
     const timeoutPromise = new Promise((_, reject) => {
       timeoutHandle = setTimeout(() => {
         if (cancellationManager) {
           cancellationManager.handleCancellation(queryId, `Timeout after ${args.timeout_ms}ms`);
+          if (rawReqId) cancellationManager.handleCancellation(rawReqId, `Timeout after ${args.timeout_ms}ms`);
         }
         reject(new Error(`Query timed out after ${args.timeout_ms}ms`));
       }, args.timeout_ms);
+    });
+
+    const abortPromise = new Promise<never>((_, reject) => {
+      const onAbort = () => {
+        const reason = cancelSignal?.reason || signal?.reason || "Query cancelled";
+        const message = reason instanceof Error ? reason.message : String(reason);
+        reject(new Error(`Execution cancelled: ${message}`));
+      };
+
+      if (signal?.aborted) return onAbort();
+      if (cancelSignal?.aborted) return onAbort();
+
+      signal?.addEventListener("abort", onAbort, { once: true });
+      cancelSignal?.addEventListener("abort", onAbort, { once: true });
     });
 
     // Se o provider tiver suporte nativo ao perfil read-only do banco (#328), executa nativamente
@@ -143,10 +167,15 @@ export async function executeRunReadQuery(
           maxResultBytes: MAX_PAYLOAD_BYTES,
         }),
         timeoutPromise,
+        abortPromise,
       ]);
     } else {
       // Fallback para query padrão protegida (bancos em memória ou sem perfil nativo)
-      rawResult = await Promise.race([provider.query(prepared.query, undefined, queryId), timeoutPromise]);
+      rawResult = await Promise.race([
+        provider.query(prepared.query, undefined, queryId),
+        timeoutPromise,
+        abortPromise,
+      ]);
     }
 
     const executionTimeMs = Date.now() - startTime;
@@ -156,13 +185,20 @@ export async function executeRunReadQuery(
     // 5. Paginação e teto de linhas (Contrato 0.16.2)
     const hasMore = prepared.wasLimited && originalCount === prepared.limit;
     const cappedRows = rawRows.slice(0, prepared.limit);
-    let truncated = (prepared.wasLimited && hasMore) || originalCount > prepared.limit;
+    let hasFieldTruncation = false;
 
     // 6. Verificação do teto de bytes com Serializador Seguro e Medição no Envelope Completo (Wire Bytes)
     let safeRows = safeSerialize(cappedRows) as Array<Record<string, unknown>>;
-    let fields: Array<{ name: string }> | undefined = rawResult.fields?.map((f: unknown) => ({
-      name: typeof f === "string" ? f : String(f),
-    }));
+    let fields: Array<{ name: string }> | undefined = rawResult.fields?.map((f: unknown) => {
+      const rawName = typeof f === "string" ? f : String(f);
+      if (rawName.length > 64) {
+        hasFieldTruncation = true;
+        return { name: `${rawName.slice(0, 64)}... [TRUNCATED]` };
+      }
+      return { name: rawName };
+    });
+
+    let truncated = (prepared.wasLimited && hasMore) || originalCount > prepared.limit || hasFieldTruncation;
 
     function truncateDeepValue(val: unknown, maxLen: number): unknown {
       if (typeof val === "string") {
@@ -183,7 +219,7 @@ export async function executeRunReadQuery(
       isTruncated: boolean,
     ) => {
       const env: QueryResultEnvelope = {
-        connection_id: args.connection_id,
+        connection_id: args.connection_id.length > 64 ? `${args.connection_id.slice(0, 64)}...` : args.connection_id,
         rows: r,
         row_count: r.length,
         truncated: isTruncated,
@@ -198,12 +234,17 @@ export async function executeRunReadQuery(
           wasLimited: prepared.wasLimited,
         },
       };
+
+      // Estabiliza o cálculo iterativo de byte_size para garantir concordância absoluta com os bytes UTF-8 no fio
       let txt = safeJsonStringify(env, 2);
-      let wb = Buffer.byteLength(txt, "utf-8");
-      env.byte_size = wb;
-      txt = safeJsonStringify(env, 2);
-      wb = Buffer.byteLength(txt, "utf-8");
-      return { env, txt, wireBytes: wb };
+      for (let i = 0; i < 3; i++) {
+        const currentBytes = Buffer.byteLength(txt, "utf-8");
+        if (env.byte_size === currentBytes) break;
+        env.byte_size = currentBytes;
+        txt = safeJsonStringify(env, 2);
+      }
+      const finalBytes = Buffer.byteLength(txt, "utf-8");
+      return { env, txt, wireBytes: finalBytes };
     };
 
     let candidate = buildEnvelopeCandidate(safeRows, fields, truncated);
@@ -226,14 +267,16 @@ export async function executeRunReadQuery(
         candidate = buildEnvelopeCandidate(safeRows, fields, truncated);
       }
 
-      // Passo C: Truncamento de strings e objetos aninhados profundos (256 -> 128 -> 64 -> 32 -> 16)
+      // Passo C: Truncamento de chaves, strings e objetos aninhados profundos (256 -> 128 -> 64 -> 32 -> 16)
       if (candidate.wireBytes > MAX_PAYLOAD_BYTES && safeRows.length > 0) {
         let maxFieldLen = 256;
         while (candidate.wireBytes > MAX_PAYLOAD_BYTES && maxFieldLen >= 16) {
+          const maxKeyLen = Math.max(32, maxFieldLen);
           safeRows = safeRows.map((row) => {
             const trimmed: Record<string, unknown> = {};
             for (const [k, v] of Object.entries(row)) {
-              trimmed[k] = truncateDeepValue(v, maxFieldLen);
+              const safeKey = k.length > maxKeyLen ? `${k.slice(0, maxKeyLen)}...` : k;
+              trimmed[safeKey] = truncateDeepValue(v, maxFieldLen);
             }
             return trimmed;
           });
@@ -259,7 +302,7 @@ export async function executeRunReadQuery(
         candidate = buildEnvelopeCandidate(safeRows, fields, truncated);
       }
 
-      // Passo E: Salvaguarda final - se 1 linha ainda passar (ex: blob resistente)
+      // Passo E: Salvaguarda final em linhas e metadados
       if (candidate.wireBytes > MAX_PAYLOAD_BYTES && safeRows.length > 1) {
         safeRows = safeRows.slice(0, 1);
         truncated = true;
@@ -267,6 +310,14 @@ export async function executeRunReadQuery(
       }
       if (candidate.wireBytes > MAX_PAYLOAD_BYTES && fields && fields.length > 10) {
         fields = fields.slice(0, 10);
+        truncated = true;
+        candidate = buildEnvelopeCandidate(safeRows, fields, truncated);
+      }
+
+      // Passo F: Salvaguarda absoluta hermética (< 64 KiB garantido matematicamente)
+      if (candidate.wireBytes > MAX_PAYLOAD_BYTES) {
+        safeRows = [];
+        fields = undefined;
         truncated = true;
         candidate = buildEnvelopeCandidate(safeRows, fields, truncated);
       }
@@ -296,6 +347,9 @@ export async function executeRunReadQuery(
     }
     if (cancellationManager) {
       cancellationManager.deregister(queryId);
+      if (rawReqId) {
+        cancellationManager.deregister(rawReqId);
+      }
     }
   }
 }
