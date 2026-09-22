@@ -3,6 +3,7 @@ import { getSession } from "@/lib/auth";
 import { getManagedConnections } from "@/lib/seed";
 import { McpConnectionContext } from "@/lib/mcp/context";
 import { McpDispatcher } from "@/lib/mcp/dispatcher";
+import { McpCancellationManager } from "@/lib/mcp/guards/cancellation";
 import { JSON_RPC_ERRORS } from "@/lib/mcp/types";
 import { logger } from "@/lib/logger";
 
@@ -97,12 +98,16 @@ export async function POST(req: NextRequest) {
     connections = [];
   }
 
-  // 4. Instanciação do Contexto e Dispatcher MCP
+  // 4. Instanciação do Contexto e Dispatcher MCP com gerenciamento de ciclo de vida e cancelamento
+  const cancellationManager = new McpCancellationManager();
   const context = new McpConnectionContext(connections);
-  const dispatcher = new McpDispatcher(context);
+  const dispatcher = new McpDispatcher(context, cancellationManager);
 
   try {
-    const result = await dispatcher.handle(body, { signal: req.signal });
+    const result = await dispatcher.handle(body, {
+      signal: req.signal,
+      cancellationManager,
+    });
 
     if (result === null) {
       // Notificações JSON-RPC não exigem corpo de resposta
@@ -123,5 +128,7 @@ export async function POST(req: NextRequest) {
       },
       { status: 500 },
     );
+  } finally {
+    await context.disconnectAll();
   }
 }

@@ -83,6 +83,16 @@ export class McpDispatcher {
           },
         };
       }
+      if (body.length > 50) {
+        return {
+          jsonrpc: "2.0",
+          id: null,
+          error: {
+            code: JSON_RPC_ERRORS.INVALID_REQUEST,
+            message: "Invalid Request: Batch size exceeds limit of 50 requests",
+          },
+        };
+      }
       const responses: JsonRpcResponse[] = [];
       for (const req of body) {
         const res = await this.handleSingle(req, requestContext);
@@ -118,6 +128,21 @@ export class McpDispatcher {
       };
     }
 
+    // Se id foi fornecido (requisição RPC, não notificação), validar conformidade MCP (string ou inteiro)
+    if (id !== undefined) {
+      const isValidId = typeof id === "string" || (typeof id === "number" && Number.isInteger(id));
+      if (!isValidId) {
+        return {
+          jsonrpc: "2.0",
+          id: null,
+          error: {
+            code: JSON_RPC_ERRORS.INVALID_REQUEST,
+            message: "Invalid Request: 'id' must be a string or an integer (cannot be null or float)",
+          },
+        };
+      }
+    }
+
     const isNotification = id === undefined;
 
     try {
@@ -137,6 +162,16 @@ export class McpDispatcher {
         }
 
         case "notifications/initialized": {
+          return null;
+        }
+
+        case "notifications/cancelled": {
+          const cancelParams = params as { requestId?: unknown; reason?: string } | undefined;
+          const reqId = cancelParams?.requestId;
+          const manager = this.cancellationManager || requestContext?.cancellationManager;
+          if (manager && (typeof reqId === "string" || typeof reqId === "number")) {
+            await manager.handleCancellation(String(reqId), cancelParams?.reason);
+          }
           return null;
         }
 

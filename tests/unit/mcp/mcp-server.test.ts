@@ -80,4 +80,26 @@ describe("MCP Server & Context Unit Tests", () => {
 
     expect(context.getConnection("conn-sqlite-dev")?.name).toBe("SQLite Renamed");
   });
+
+  test("gerencia single-flight mutex em getProvider evitando instanciação concorrente duplicada", async () => {
+    const context = new McpConnectionContext([
+      {
+        id: "race-conn",
+        name: "Race Test SQLite",
+        type: "sqlite",
+        database: "seed-assets/sqlite/employee.db",
+        createdAt: new Date(),
+      },
+    ]);
+
+    const results = await Promise.all(
+      Array.from({ length: 10 }, () => context.getProvider("race-conn", "agent-read-only")),
+    );
+
+    expect(results.length).toBe(10);
+    const uniqueInstances = new Set(results);
+    expect(uniqueInstances.size).toBe(1);
+
+    await context.disconnectAll();
+  });
 });

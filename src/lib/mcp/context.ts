@@ -25,12 +25,17 @@ export class McpConnectionContext {
     const version = (this.connectionVersions.get(connection.id) || 0) + 1;
     this.connectionVersions.set(connection.id, version);
 
-    const existing = this.activeProviders.get(connection.id);
-    if (existing) {
-      existing.disconnect?.().catch(() => {});
-      this.activeProviders.delete(connection.id);
+    for (const [key, provider] of this.activeProviders.entries()) {
+      if (key === connection.id || key.startsWith(`${connection.id}:`)) {
+        provider.disconnect?.().catch(() => {});
+        this.activeProviders.delete(key);
+      }
     }
-    this.pendingProviders.delete(connection.id);
+    for (const key of this.pendingProviders.keys()) {
+      if (key === connection.id || key.startsWith(`${connection.id}:`)) {
+        this.pendingProviders.delete(key);
+      }
+    }
     this.connections.set(connection.id, connection);
   }
 
@@ -66,9 +71,8 @@ export class McpConnectionContext {
 
   /**
    * Obtém ou inicializa com conexão real uma instância de provider.
-   * Se um ExecutionProfile for passado, utiliza diretamente a barreira canônica
-   * acquireExecutionProfileProvider (factory.ts:781).
-   * Caso contrário, utiliza o cache local com single-flight.
+   * Suporta ExecutionProfile com single-flight mutex chaveado por connectionId:profile,
+   * evitando instanciação duplicada durante rajadas concorrentes.
    */
   public async getProvider(connectionId: string, profile?: ExecutionProfile): Promise<DatabaseProvider> {
     const connection = this.connections.get(connectionId);
@@ -76,21 +80,19 @@ export class McpConnectionContext {
       throw new Error(`Connection not found: "${connectionId}"`);
     }
 
-    if (profile) {
-      return acquireExecutionProfileProvider(connection, profile);
-    }
+    const cacheKey = profile ? `${connectionId}:${profile}` : connectionId;
 
-    const cached = this.activeProviders.get(connectionId);
+    const cached = this.activeProviders.get(cacheKey);
     if (cached) {
       if (!cached.isConnected || cached.isConnected()) {
         return cached;
       }
       // Se estava desconectado, limpa e reconecta
-      this.activeProviders.delete(connectionId);
+      this.activeProviders.delete(cacheKey);
     }
 
-    // Se já existe uma inicialização em andamento para este ID, reutiliza a Promise (Single-Flight)
-    const pending = this.pendingProviders.get(connectionId);
+    // Se já existe uma inicialização em andamento para este cacheKey, reutiliza a Promise (Single-Flight)
+    const pending = this.pendingProviders.get(cacheKey);
     if (pending) {
       return pending;
     }
@@ -99,10 +101,15 @@ export class McpConnectionContext {
 
     const initPromise = (async () => {
       try {
-        const provider = await createDatabaseProvider(connection);
-        // Conectar explicitamente o pool / driver antes de servir queries
-        if (typeof provider.connect === "function") {
-          await provider.connect();
+        let provider: DatabaseProvider;
+        if (profile) {
+          provider = await acquireExecutionProfileProvider(connection, profile);
+        } else {
+          provider = await createDatabaseProvider(connection);
+          // Conectar explicitamente o pool / driver antes de servir queries
+          if (typeof provider.connect === "function") {
+            await provider.connect();
+          }
         }
 
         // Verificação defensiva de corrida: se a conexão foi re-registrada enquanto
@@ -115,14 +122,14 @@ export class McpConnectionContext {
           throw new Error(`Connection "${connectionId}" was invalidated during initialization`);
         }
 
-        this.activeProviders.set(connectionId, provider);
+        this.activeProviders.set(cacheKey, provider);
         return provider;
       } finally {
-        this.pendingProviders.delete(connectionId);
+        this.pendingProviders.delete(cacheKey);
       }
     })();
 
-    this.pendingProviders.set(connectionId, initPromise);
+    this.pendingProviders.set(cacheKey, initPromise);
     return initPromise;
   }
 

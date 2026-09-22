@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { McpConnectionContext } from "@/lib/mcp/context";
 import { McpDispatcher } from "@/lib/mcp/dispatcher";
+import { McpCancellationManager } from "@/lib/mcp/guards/cancellation";
 import { JSON_RPC_ERRORS } from "@/lib/mcp/types";
 import type { DatabaseConnection } from "@/lib/db/types";
 
@@ -14,8 +15,9 @@ describe("MCP Dispatcher (JSON-RPC 2.0 Engine)", () => {
     createdAt: new Date(),
   };
 
+  const cancellationManager = new McpCancellationManager();
   const context = new McpConnectionContext([mockConnection]);
-  const dispatcher = new McpDispatcher(context);
+  const dispatcher = new McpDispatcher(context, cancellationManager);
 
   test("processa requisição 'initialize' e retorna handshake 2024-11-05", async () => {
     const request = {
@@ -153,5 +155,44 @@ describe("MCP Dispatcher (JSON-RPC 2.0 Engine)", () => {
     expect(responses.length).toBe(2);
     expect(responses[0].id).toBe(1);
     expect(responses[1].id).toBe(2);
+  });
+
+  test("rejeita IDs inválidos (null, float, objeto) com INVALID_REQUEST (-32600)", async () => {
+    const rNull = (await dispatcher.handle({ jsonrpc: "2.0", id: null, method: "ping" })) as any;
+    expect(rNull.error.code).toBe(JSON_RPC_ERRORS.INVALID_REQUEST);
+
+    const rFloat = (await dispatcher.handle({ jsonrpc: "2.0", id: 1.5, method: "ping" })) as any;
+    expect(rFloat.error.code).toBe(JSON_RPC_ERRORS.INVALID_REQUEST);
+
+    const rObj = (await dispatcher.handle({ jsonrpc: "2.0", id: { bad: true }, method: "ping" })) as any;
+    expect(rObj.error.code).toBe(JSON_RPC_ERRORS.INVALID_REQUEST);
+  });
+
+  test("rejeita lote que excede limite de 50 requisições com INVALID_REQUEST", async () => {
+    const hugeBatch = Array.from({ length: 51 }, (_, i) => ({
+      jsonrpc: "2.0",
+      id: i + 1,
+      method: "ping",
+    }));
+
+    const response = (await dispatcher.handle(hugeBatch)) as any;
+    expect(response.error.code).toBe(JSON_RPC_ERRORS.INVALID_REQUEST);
+    expect(response.error.message).toContain("limit of 50");
+  });
+
+  test("processa notificação notifications/cancelled chamando cancellationManager", async () => {
+    let cancelled = false;
+    cancellationManager.register("test-req-1", "conn-x", async () => {
+      cancelled = true;
+    });
+
+    const response = await dispatcher.handle({
+      jsonrpc: "2.0",
+      method: "notifications/cancelled",
+      params: { requestId: "test-req-1", reason: "User cancelled" },
+    });
+
+    expect(response).toBeNull();
+    expect(cancelled).toBe(true);
   });
 });

@@ -135,34 +135,17 @@ export async function executeRunReadQuery(
     });
 
     // Se o provider tiver suporte nativo ao perfil read-only do banco (#328), executa nativamente
-    if (typeof provider.queryReadOnly === "function") {
-      try {
-        rawResult = await Promise.race([
-          provider.queryReadOnly(prepared.query, {
-            maxResultRows: prepared.limit,
-            statementTimeoutMs: args.timeout_ms,
-            maxResultBytes: MAX_PAYLOAD_BYTES,
-          }),
-          timeoutPromise,
-        ]);
-      } catch (err: any) {
-        // Se foi timeout, propaga imediatamente sem tentar o fallback
-        if (err?.message?.includes("timed out")) {
-          throw err;
-        }
-        // Apenas faz fallback se for banco em memória (:memory:) onde arquivo read-only não existe (#328)
-        const isUnsupportedMemory =
-          err?.message?.includes(":memory:") ||
-          err?.message?.includes("not supported") ||
-          err?.message?.includes("profile");
-        if (isUnsupportedMemory) {
-          rawResult = await Promise.race([provider.query(prepared.query, undefined, queryId), timeoutPromise]);
-        } else {
-          throw err;
-        }
-      }
+    if ((provider as any).readOnlyProfile === true && typeof provider.queryReadOnly === "function") {
+      rawResult = await Promise.race([
+        provider.queryReadOnly(prepared.query, {
+          maxResultRows: prepared.limit,
+          statementTimeoutMs: args.timeout_ms,
+          maxResultBytes: MAX_PAYLOAD_BYTES,
+        }),
+        timeoutPromise,
+      ]);
     } else {
-      // Fallback para query padrão protegida
+      // Fallback para query padrão protegida (bancos em memória ou sem perfil nativo)
       rawResult = await Promise.race([provider.query(prepared.query, undefined, queryId), timeoutPromise]);
     }
 
@@ -175,78 +158,125 @@ export async function executeRunReadQuery(
     const cappedRows = rawRows.slice(0, prepared.limit);
     let truncated = (prepared.wasLimited && hasMore) || originalCount > prepared.limit;
 
-    // 6. Verificação do teto de bytes com Serializador Seguro
-    let safeRows = safeSerialize(cappedRows);
-    let stringified = safeJsonStringify(safeRows);
-    let byteSize = Buffer.byteLength(stringified, "utf-8");
+    // 6. Verificação do teto de bytes com Serializador Seguro e Medição no Envelope Completo (Wire Bytes)
+    let safeRows = safeSerialize(cappedRows) as Array<Record<string, unknown>>;
+    let fields: Array<{ name: string }> | undefined = rawResult.fields?.map((f: unknown) => ({
+      name: typeof f === "string" ? f : String(f),
+    }));
 
-    if (byteSize > MAX_PAYLOAD_BYTES) {
-      while (safeRows.length > 1 && byteSize > MAX_PAYLOAD_BYTES) {
-        safeRows = safeRows.slice(0, Math.floor(safeRows.length * 0.75));
-        stringified = safeJsonStringify(safeRows);
-        byteSize = Buffer.byteLength(stringified, "utf-8");
+    function truncateDeepValue(val: unknown, maxLen: number): unknown {
+      if (typeof val === "string") {
+        return val.length > maxLen ? `${val.slice(0, maxLen)}... [TRUNCATED]` : val;
+      }
+      if (val !== null && typeof val === "object") {
+        const str = safeJsonStringify(val);
+        if (str.length > maxLen) {
+          return `${str.slice(0, maxLen)}... [TRUNCATED OBJECT]`;
+        }
+      }
+      return val;
+    }
+
+    const buildEnvelopeCandidate = (
+      r: Array<Record<string, unknown>>,
+      f: Array<{ name: string }> | undefined,
+      isTruncated: boolean,
+    ) => {
+      const env: QueryResultEnvelope = {
+        connection_id: args.connection_id,
+        rows: r,
+        row_count: r.length,
+        truncated: isTruncated,
+        byte_size: 0,
+        execution_time_ms: executionTimeMs,
+        fields: f,
+        pagination: {
+          limit: prepared.limit,
+          offset: prepared.offset,
+          hasMore,
+          totalReturned: originalCount,
+          wasLimited: prepared.wasLimited,
+        },
+      };
+      let txt = safeJsonStringify(env, 2);
+      let wb = Buffer.byteLength(txt, "utf-8");
+      env.byte_size = wb;
+      txt = safeJsonStringify(env, 2);
+      wb = Buffer.byteLength(txt, "utf-8");
+      return { env, txt, wireBytes: wb };
+    };
+
+    let candidate = buildEnvelopeCandidate(safeRows, fields, truncated);
+
+    if (candidate.wireBytes > MAX_PAYLOAD_BYTES) {
+      // Passo A: Se houver mais de 50 colunas nos metadados, limita fields para proteger o wire budget
+      if (fields && fields.length > 50) {
+        fields = [
+          ...fields.slice(0, 50),
+          { name: `... [TRUNCATED: ${fields.length - 50} colunas adicionais omitidas]` },
+        ];
         truncated = true;
+        candidate = buildEnvelopeCandidate(safeRows, fields, truncated);
       }
 
-      // Se mesmo com poucas linhas ainda ultrapassa 64 KB (ex: 80 colunas largas):
-      if (byteSize > MAX_PAYLOAD_BYTES && safeRows.length > 0) {
+      // Passo B: Redução geométrica de linhas (75% por iteração)
+      while (safeRows.length > 1 && candidate.wireBytes > MAX_PAYLOAD_BYTES) {
+        safeRows = safeRows.slice(0, Math.floor(safeRows.length * 0.75));
+        truncated = true;
+        candidate = buildEnvelopeCandidate(safeRows, fields, truncated);
+      }
+
+      // Passo C: Truncamento de strings e objetos aninhados profundos (256 -> 128 -> 64 -> 32 -> 16)
+      if (candidate.wireBytes > MAX_PAYLOAD_BYTES && safeRows.length > 0) {
         let maxFieldLen = 256;
-        while (byteSize > MAX_PAYLOAD_BYTES && maxFieldLen >= 16) {
+        while (candidate.wireBytes > MAX_PAYLOAD_BYTES && maxFieldLen >= 16) {
           safeRows = safeRows.map((row) => {
             const trimmed: Record<string, unknown> = {};
             for (const [k, v] of Object.entries(row)) {
-              if (typeof v === "string" && v.length > maxFieldLen) {
-                trimmed[k] = `${v.slice(0, maxFieldLen)}... [TRUNCATED]`;
-              } else {
-                trimmed[k] = v;
-              }
+              trimmed[k] = truncateDeepValue(v, maxFieldLen);
             }
             return trimmed;
           });
-          stringified = safeJsonStringify(safeRows);
-          byteSize = Buffer.byteLength(stringified, "utf-8");
           truncated = true;
+          candidate = buildEnvelopeCandidate(safeRows, fields, truncated);
           maxFieldLen = Math.floor(maxFieldLen / 2);
         }
+      }
 
-        // Se ainda assim exceder 64 KB, corta colunas excedentes
-        if (byteSize > MAX_PAYLOAD_BYTES && safeRows.length > 0) {
-          safeRows = safeRows.map((row) => {
-            const entries = Object.entries(row);
-            const cappedEntries = entries.slice(0, Math.min(entries.length, 25));
-            const trimmed: Record<string, unknown> = Object.fromEntries(cappedEntries);
-            trimmed["_truncation_warning"] = "[TRUNCATED: colunas excedentes omitidas para respeitar o teto de 64 KB]";
-            return trimmed;
-          });
-          stringified = safeJsonStringify(safeRows);
-          byteSize = Buffer.byteLength(stringified, "utf-8");
-          truncated = true;
+      // Passo D: Se ainda ultrapassar 64 KiB, poda colunas excedentes nas linhas e metadados
+      if (candidate.wireBytes > MAX_PAYLOAD_BYTES && safeRows.length > 0) {
+        safeRows = safeRows.map((row) => {
+          const entries = Object.entries(row);
+          const cappedEntries = entries.slice(0, Math.min(entries.length, 25));
+          const trimmed: Record<string, unknown> = Object.fromEntries(cappedEntries);
+          trimmed["_truncation_warning"] = "[TRUNCATED: colunas excedentes omitidas para respeitar o teto de 64 KB]";
+          return trimmed;
+        });
+        if (fields && fields.length > 25) {
+          fields = [...fields.slice(0, 25), { name: "... [TRUNCATED: colunas excedentes omitidas]" }];
         }
+        truncated = true;
+        candidate = buildEnvelopeCandidate(safeRows, fields, truncated);
+      }
+
+      // Passo E: Salvaguarda final - se 1 linha ainda passar (ex: blob resistente)
+      if (candidate.wireBytes > MAX_PAYLOAD_BYTES && safeRows.length > 1) {
+        safeRows = safeRows.slice(0, 1);
+        truncated = true;
+        candidate = buildEnvelopeCandidate(safeRows, fields, truncated);
+      }
+      if (candidate.wireBytes > MAX_PAYLOAD_BYTES && fields && fields.length > 10) {
+        fields = fields.slice(0, 10);
+        truncated = true;
+        candidate = buildEnvelopeCandidate(safeRows, fields, truncated);
       }
     }
-
-    const envelope: QueryResultEnvelope = {
-      connection_id: args.connection_id,
-      rows: safeRows,
-      row_count: safeRows.length,
-      truncated,
-      byte_size: byteSize,
-      execution_time_ms: executionTimeMs,
-      fields: rawResult.fields?.map((f: unknown) => ({ name: typeof f === "string" ? f : String(f) })),
-      pagination: {
-        limit: prepared.limit,
-        offset: prepared.offset,
-        hasMore,
-        totalReturned: originalCount,
-        wasLimited: prepared.wasLimited,
-      },
-    };
 
     return {
       content: [
         {
           type: "text",
-          text: safeJsonStringify(envelope, 2),
+          text: candidate.txt,
         },
       ],
     };
