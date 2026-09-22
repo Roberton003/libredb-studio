@@ -253,6 +253,7 @@ const ROUTES_WITHOUT_A_PROVIDER: Record<string, string> = {
   "storage/[collection]": "same storage backend as above, scoped to the caller's own data (PUT, no POST export)",
   "storage/config": "publicly documents whether server storage is enabled; no session, no provider (GET only)",
   "storage/migrate": "same storage backend as above; its own 401 body differs from guardRoute's on purpose",
+  mcp: "reaches a provider, but is the MCP JSON-RPC 2.0 endpoint: it authenticates via session cookie or x-libredb-mcp-token and its 401 body is JSON-RPC formatted on purpose (tests/integration/mcp/http-route.test.ts)",
 };
 
 const PROVIDER_ROUTES = ALL_ROUTES.filter(([key]) => !(key in ROUTES_WITHOUT_A_PROVIDER));
@@ -345,7 +346,7 @@ describe("routes that reach a provider require a session", () => {
   // on ROUTES_WITHOUT_A_PROVIDER). Skipping it is itself verified below - the assertion requires
   // the entry's reason to still say so, so this set cannot quietly grow into a second unchecked
   // allowlist.
-  const ALLOWLISTED_BUT_REACHES_A_PROVIDER = ["agent/drive"];
+  const ALLOWLISTED_BUT_REACHES_A_PROVIDER = ["agent/drive", "mcp"];
 
   /** Blanks out comments while preserving line numbering, so a mention in prose is not a hit. */
   function withoutComments(source: string): string {

@@ -3,7 +3,8 @@ import { createMockRequest, parseResponseJSON } from "../../helpers/mock-next";
 
 let mockSessionResult: { role: string; username: string } | null = { role: "admin", username: "admin" };
 
-mock.module("@/lib/auth", () => ({
+const authModule = "@/lib/auth";
+mock.module(authModule, () => ({
   getSession: mock(async () => mockSessionResult),
 }));
 

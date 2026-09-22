@@ -220,7 +220,7 @@ export class McpDispatcher {
         }
       }
     } catch (err: any) {
-      logger.error("Error dispatching MCP request", { method, err });
+      logger.error("Error dispatching MCP request", err, { method });
       return isNotification
         ? null
         : {

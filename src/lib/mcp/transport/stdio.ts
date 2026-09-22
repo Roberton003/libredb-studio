@@ -67,7 +67,7 @@ export async function startStdioMcpServer(instance: McpServerInstance): Promise<
       await context.closeAll();
       await server.close();
     } catch (err) {
-      logger.error("Error during graceful MCP shutdown", { err });
+      logger.error("Error during graceful MCP shutdown", err);
     } finally {
       restoreConsole();
       process.exit(0);

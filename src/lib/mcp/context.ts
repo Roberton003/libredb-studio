@@ -1,6 +1,6 @@
 import type { DatabaseConnection } from "@/lib/types";
 import type { DatabaseProvider } from "@/lib/db/types";
-import { acquireExecutionProfileProvider, createDatabaseProvider, type ExecutionProfile } from "@/lib/db/factory";
+import { acquireExecutionProfileProvider, getOrCreateProvider, type ExecutionProfile } from "@/lib/db/factory";
 import type { PublicConnectionMetadata } from "./types";
 import { logger } from "@/lib/logger";
 
@@ -137,11 +137,7 @@ export class McpConnectionContext {
         if (profile) {
           provider = await acquireExecutionProfileProvider(connection, profile);
         } else {
-          provider = await createDatabaseProvider(connection);
-          // Conectar explicitamente o pool / driver antes de servir queries
-          if (typeof provider.connect === "function") {
-            await provider.connect();
-          }
+          provider = await getOrCreateProvider(connection);
         }
 
         // Verificação defensiva de corrida: se a conexão foi re-registrada enquanto
