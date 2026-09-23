@@ -1,5 +1,5 @@
 import type { McpConnectionContext } from "../context";
-import { safeJsonStringify } from "../serializer";
+import { safeJsonStringify, redactErrorMessage } from "../serializer";
 import {
   type InspectSchemaInput,
   InspectSchemaInputSchema,
@@ -8,27 +8,13 @@ import {
 } from "../types";
 
 /**
- * Executa a inspeção de esquema através de todos os 17 engines do LibreDB Studio
- * utilizando o perfil canônico 'agent-operations' (sem restrição de escrita em bancos single-writer).
+ * Inspects database schema, tables, views, and columns across supported engines
+ * using the canonical 'agent-operations' profile.
  */
 export async function executeInspectSchema(args: unknown, context: McpConnectionContext): Promise<McpCallResult> {
   try {
-    const parsed = InspectSchemaInputSchema.parse(args || {});
-    // Adquire o provider com perfil "agent-operations", suportado em todos os 17 bancos
-    let provider: any;
-    try {
-      provider = await context.getProvider(parsed.connection_id, "agent-operations");
-    } catch (err: any) {
-      if (
-        err?.reasonCode === "PROFILE_UNSUPPORTED_TARGET" ||
-        err?.message?.toLowerCase().includes("in-memory") ||
-        err?.message?.includes(":memory:")
-      ) {
-        provider = await context.getProvider(parsed.connection_id);
-      } else {
-        throw err;
-      }
-    }
+    const parsed: InspectSchemaInput = InspectSchemaInputSchema.parse(args || {});
+    const provider = await context.getProvider(parsed.connection_id, "agent-operations");
 
     // 1. Determinar o container (schema/catalog)
     const containers = await provider.listContainers();
@@ -77,21 +63,43 @@ export async function executeInspectSchema(args: unknown, context: McpConnection
           const detail = await provider.describeObject(obj.path, "table");
 
           if (parsed.include_columns && detail.columns) {
-            columns = detail.columns.map((c: any) => ({
+            const rawCols = Array.isArray(detail.columns) ? detail.columns : [];
+            const isColsTruncated = rawCols.length > 50;
+            const slicedCols = rawCols.slice(0, 50);
+            columns = slicedCols.map((c: any) => ({
               name: c.name,
               data_type: c.type,
               is_nullable: c.nullable ?? true,
               default_value: c.defaultValue !== undefined ? String(c.defaultValue) : null,
               is_primary_key: Boolean(c.isPrimary),
             }));
+            if (isColsTruncated) {
+              columns.push({
+                name: `... [TRUNCATED: ${rawCols.length - 50} additional columns omitted]`,
+                data_type: "text",
+                is_nullable: true,
+                default_value: null,
+                is_primary_key: false,
+              });
+            }
           }
 
           if (parsed.include_indexes && detail.indexes) {
-            indexes = detail.indexes.map((idx: any) => ({
+            const rawIdx = Array.isArray(detail.indexes) ? detail.indexes : [];
+            const isIdxTruncated = rawIdx.length > 25;
+            const slicedIdx = rawIdx.slice(0, 25);
+            indexes = slicedIdx.map((idx: any) => ({
               name: idx.name,
               columns: [...idx.columns],
               is_unique: Boolean(idx.unique),
             }));
+            if (isIdxTruncated) {
+              indexes.push({
+                name: `... [TRUNCATED: ${rawIdx.length - 25} additional indexes omitted]`,
+                columns: [],
+                is_unique: false,
+              });
+            }
           }
         } catch {
           comment = "[Partial schema: failed to describe columns]";
@@ -118,11 +126,21 @@ export async function executeInspectSchema(args: unknown, context: McpConnection
       tables: tablesDetails,
     };
 
+    let jsonText = safeJsonStringify(result, 2);
+    // Defense in depth: if payload still exceeds 64 KiB, truncate tables
+    if (Buffer.byteLength(jsonText) > 64 * 1024) {
+      while (tablesDetails.length > 1 && Buffer.byteLength(safeJsonStringify(result, 2)) > 64 * 1024) {
+        tablesDetails.pop();
+      }
+      result.has_more = true;
+      jsonText = safeJsonStringify(result, 2);
+    }
+
     return {
       content: [
         {
           type: "text",
-          text: safeJsonStringify(result, 2),
+          text: jsonText,
         },
       ],
     };
@@ -132,23 +150,9 @@ export async function executeInspectSchema(args: unknown, context: McpConnection
       content: [
         {
           type: "text",
-          text: `Failed to inspect schema: ${error?.message || String(error)}`,
+          text: `Failed to inspect schema: ${redactErrorMessage(error?.message || String(error))}`,
         },
       ],
     };
   }
-}
-
-/**
- * Registra a ferramenta `inspect_schema` no McpServer (SDK STDIO)
- */
-export function registerInspectSchemaTool(server: any, context: McpConnectionContext): void {
-  server.tool(
-    "inspect_schema",
-    "Inspeciona o catálogo e esquema de tabelas de uma conexão de forma paginada e defensiva",
-    InspectSchemaInputSchema.shape,
-    async (args: InspectSchemaInput) => {
-      return executeInspectSchema(args, context);
-    },
-  );
 }

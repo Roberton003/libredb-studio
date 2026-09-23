@@ -4,17 +4,19 @@ import { executeListConnections } from "./tools/list-connections";
 import { executeInspectSchema } from "./tools/inspect-schema";
 import { executeRunReadQuery } from "./tools/run-read-query";
 import { JSON_RPC_ERRORS, type JsonRpcRequest, type JsonRpcResponse, type McpToolDefinition } from "./types";
+import { redactError } from "./serializer";
 import { logger } from "@/lib/logger";
 
 export interface McpRequestContext {
   cancellationManager?: McpCancellationManager;
   signal?: AbortSignal;
+  callerId?: string;
 }
 
 const MCP_TOOLS_DEFINITIONS: McpToolDefinition[] = [
   {
     name: "list_connections",
-    description: "Lista todas as conexões de banco de dados disponíveis no LibreDB Studio (sem expor credenciais)",
+    description: "List all database connections configured in LibreDB Studio without exposing credentials.",
     inputSchema: {
       type: "object",
       properties: {
@@ -22,7 +24,7 @@ const MCP_TOOLS_DEFINITIONS: McpToolDefinition[] = [
           type: "string",
           enum: ["all", "development", "staging", "production", "local", "other"],
           default: "all",
-          description: "Filtrar por ambiente da conexão",
+          description: "Filter connections by environment tier.",
         },
       },
     },
@@ -30,14 +32,14 @@ const MCP_TOOLS_DEFINITIONS: McpToolDefinition[] = [
   {
     name: "inspect_schema",
     description:
-      "Inspeciona o catálogo e esquema de tabelas de uma conexão de forma paginada e defensiva através de todos os 17 bancos",
+      "Inspect catalog schemas, tables, columns, and indexes with pagination support across all supported databases.",
     inputSchema: {
       type: "object",
       required: ["connection_id"],
       properties: {
-        connection_id: { type: "string", description: "ID da conexão no LibreDB Studio" },
-        schema: { type: "string", description: "Nome do schema ou container alvo" },
-        table: { type: "string", description: "Nome específico da tabela para inspecionar" },
+        connection_id: { type: "string", description: "LibreDB Studio connection identifier." },
+        schema: { type: "string", description: "Target schema name or database catalog." },
+        table: { type: "string", description: "Specific table name to inspect." },
         limit: { type: "integer", minimum: 1, maximum: 100, default: 50 },
         offset: { type: "integer", minimum: 0, default: 0 },
         include_columns: { type: "boolean", default: true },
@@ -48,13 +50,13 @@ const MCP_TOOLS_DEFINITIONS: McpToolDefinition[] = [
   {
     name: "run_read_query",
     description:
-      "Executa uma consulta SQL em modo estritamente leitura (SELECT / WITH) com orçamento rigoroso de linhas e bytes",
+      "Execute a strictly read-only SQL query (SELECT / WITH) with strict execution guardrails and timeouts.",
     inputSchema: {
       type: "object",
       required: ["connection_id", "sql"],
       properties: {
-        connection_id: { type: "string", description: "ID da conexão no LibreDB Studio" },
-        sql: { type: "string", description: "Instrução SQL SELECT a ser executada" },
+        connection_id: { type: "string", description: "LibreDB Studio connection identifier." },
+        sql: { type: "string", description: "Read-only SQL statement to execute." },
         max_rows: { type: "integer", minimum: 1, maximum: 500, default: 100 },
         timeout_ms: { type: "integer", minimum: 500, maximum: 30000, default: 10000 },
       },
@@ -98,6 +100,13 @@ export class McpDispatcher {
         const res = await this.handleSingle(req, requestContext);
         if (res) responses.push(res);
       }
+      if (responses.length === 0) {
+        return null;
+      }
+      const maxBatchWireBytes = 64 * 1024 + 1024;
+      while (responses.length > 1 && Buffer.byteLength(JSON.stringify(responses)) > maxBatchWireBytes) {
+        responses.pop();
+      }
       return responses;
     }
     return this.handleSingle(body, requestContext);
@@ -117,10 +126,13 @@ export class McpDispatcher {
 
     const { jsonrpc, id, method, params } = req as Partial<JsonRpcRequest>;
 
+    const isValidId = (typeof id === "string" && id.length <= 256) || (typeof id === "number" && Number.isInteger(id));
+    const safeId = isValidId ? id : null;
+
     if (jsonrpc !== "2.0" || typeof method !== "string") {
       return {
         jsonrpc: "2.0",
-        id: id ?? null,
+        id: safeId,
         error: {
           code: JSON_RPC_ERRORS.INVALID_REQUEST,
           message: "Invalid Request: 'jsonrpc' must be '2.0' and 'method' must be a string",
@@ -128,19 +140,28 @@ export class McpDispatcher {
       };
     }
 
-    // Se id foi fornecido (requisição RPC, não notificação), validar conformidade MCP (string ou inteiro)
-    if (id !== undefined) {
-      const isValidId = typeof id === "string" || (typeof id === "number" && Number.isInteger(id));
-      if (!isValidId) {
-        return {
-          jsonrpc: "2.0",
-          id: null,
-          error: {
-            code: JSON_RPC_ERRORS.INVALID_REQUEST,
-            message: "Invalid Request: 'id' must be a string or an integer (cannot be null or float)",
-          },
-        };
-      }
+    // Se id foi fornecido (requisição RPC, não notificação), validar conformidade MCP
+    if (id !== undefined && !isValidId) {
+      return {
+        jsonrpc: "2.0",
+        id: null,
+        error: {
+          code: JSON_RPC_ERRORS.INVALID_REQUEST,
+          message: "Invalid Request: 'id' must be a string (max 256 chars) or an integer",
+        },
+      };
+    }
+
+    // Se params foi fornecido, deve ser um objeto ou array estruturado
+    if (params !== undefined && (typeof params !== "object" || params === null)) {
+      return {
+        jsonrpc: "2.0",
+        id: safeId,
+        error: {
+          code: JSON_RPC_ERRORS.INVALID_PARAMS,
+          message: "Invalid params: must be a structured object or array when provided",
+        },
+      };
     }
 
     const isNotification = id === undefined;
@@ -169,9 +190,9 @@ export class McpDispatcher {
           const cancelParams = params as { requestId?: unknown; reason?: string } | undefined;
           const reqId = cancelParams?.requestId;
           const manager = this.cancellationManager || requestContext?.cancellationManager;
+          const callerId = requestContext?.callerId || "anonymous";
           if (manager && (typeof reqId === "string" || typeof reqId === "number")) {
-            await manager.handleCancellation(String(reqId), cancelParams?.reason);
-            await manager.handleCancellation(`mcp_${reqId}`, cancelParams?.reason);
+            void manager.handleCancellation(callerId, reqId, cancelParams?.reason);
           }
           return null;
         }
@@ -219,8 +240,9 @@ export class McpDispatcher {
               };
         }
       }
-    } catch (err: any) {
-      logger.error("Error dispatching MCP request", err, { method });
+    } catch (err: unknown) {
+      const safeError = redactError(err);
+      logger.error("Error dispatching MCP request", safeError, { method });
       return isNotification
         ? null
         : {
@@ -228,7 +250,7 @@ export class McpDispatcher {
             id,
             error: {
               code: JSON_RPC_ERRORS.INTERNAL_ERROR,
-              message: err?.message || "Internal server error during MCP dispatch",
+              message: safeError.message,
             },
           };
     }
@@ -250,6 +272,7 @@ export class McpDispatcher {
       case "run_read_query":
         return executeRunReadQuery(args, this.context, {
           requestId,
+          callerId: requestContext?.callerId,
           signal: requestContext?.signal,
           cancellationManager: this.cancellationManager || requestContext?.cancellationManager,
         });

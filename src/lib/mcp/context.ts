@@ -3,6 +3,7 @@ import type { DatabaseProvider } from "@/lib/db/types";
 import { acquireExecutionProfileProvider, getOrCreateProvider, type ExecutionProfile } from "@/lib/db/factory";
 import type { PublicConnectionMetadata } from "./types";
 import { logger } from "@/lib/logger";
+import { redactError } from "./serializer";
 
 export class McpConnectionContext {
   private connections = new Map<string, DatabaseConnection>();
@@ -164,13 +165,13 @@ export class McpConnectionContext {
   /**
    * Encerra todos os providers ativos gerenciados globalmente.
    */
-  public async disconnectAll(): Promise<void> {
+  public static async disconnectActiveProviders(): Promise<void> {
     const disconnectPromises: Promise<void>[] = [];
     for (const [key, provider] of McpConnectionContext.activeProviders.entries()) {
       if (typeof provider.disconnect === "function") {
         disconnectPromises.push(
           provider.disconnect().catch((err) => {
-            logger.warn(`Error disconnecting provider during MCP shutdown`, { key, err });
+            logger.warn(`Error disconnecting provider during MCP shutdown`, { key, error: redactError(err) });
           }),
         );
       }
@@ -178,6 +179,10 @@ export class McpConnectionContext {
     McpConnectionContext.activeProviders.clear();
     McpConnectionContext.pendingProviders.clear();
     await Promise.all(disconnectPromises);
+  }
+
+  public async disconnectAll(): Promise<void> {
+    return McpConnectionContext.disconnectActiveProviders();
   }
 
   public static setCachedProvider(
@@ -190,8 +195,7 @@ export class McpConnectionContext {
   }
 
   public static async resetGlobalCache(): Promise<void> {
-    McpConnectionContext.activeProviders.clear();
-    McpConnectionContext.pendingProviders.clear();
+    await McpConnectionContext.disconnectActiveProviders();
     McpConnectionContext.connectionVersions.clear();
     McpConnectionContext.registeredConnectionsJson.clear();
   }

@@ -1,8 +1,36 @@
-import { beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, beforeAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { Database } from "bun:sqlite";
+import { existsSync, mkdtempSync, rmSync, unlinkSync } from "fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createMockRequest, parseResponseJSON } from "../../helpers/mock-next";
 
+const TEST_DIR = mkdtempSync(join(tmpdir(), "libredb-mcp-"));
+const TEST_DB_PATH = join(TEST_DIR, "test.db");
+
+function setupTestDatabase() {
+  if (existsSync(TEST_DB_PATH)) {
+    try {
+      unlinkSync(TEST_DB_PATH);
+    } catch {}
+  }
+  const db = new Database(TEST_DB_PATH, { create: true });
+  db.run("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)");
+  db.run("INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob')");
+  db.close();
+}
+
+async function cleanupTestDatabase() {
+  await McpConnectionContext.resetGlobalCache();
+  if (existsSync(TEST_DIR)) {
+    try {
+      rmSync(TEST_DIR, { recursive: true, force: true });
+    } catch {}
+  }
+}
+
 let mockSessionResult: { role: string; username: string } | null = { role: "admin", username: "admin" };
-let mockGetManagedConnectionsThrow = false;
+let mockGetManagedConnectionsError: Error | null = null;
 
 const authModule = "@/lib/auth";
 mock.module(authModule, () => ({
@@ -11,8 +39,8 @@ mock.module(authModule, () => ({
 
 mock.module("@/lib/seed", () => ({
   getManagedConnections: mock(async () => {
-    if (mockGetManagedConnectionsThrow) {
-      throw new Error("Simulated managed connections failure");
+    if (mockGetManagedConnectionsError) {
+      throw mockGetManagedConnectionsError;
     }
     return [
       {
@@ -26,6 +54,13 @@ mock.module("@/lib/seed", () => ({
         id: "demo-sqlite",
         name: "Demo SQLite",
         type: "sqlite",
+        database: TEST_DB_PATH,
+        environment: "local",
+      },
+      {
+        id: "demo-sqlite-memory",
+        name: "Demo SQLite Memory",
+        type: "sqlite",
         database: ":memory:",
         environment: "local",
       },
@@ -36,11 +71,20 @@ mock.module("@/lib/seed", () => ({
 import { GET, POST } from "@/app/api/mcp/route";
 import { McpConnectionContext } from "@/lib/mcp/context";
 import { McpDispatcher } from "@/lib/mcp/dispatcher";
+import { logger } from "@/lib/logger";
 
 describe("MCP Next.js Route Integration (/api/mcp)", () => {
+  beforeAll(() => {
+    setupTestDatabase();
+  });
+
+  afterAll(async () => {
+    await cleanupTestDatabase();
+  });
+
   beforeEach(async () => {
     mockSessionResult = { role: "admin", username: "admin" };
-    mockGetManagedConnectionsThrow = false;
+    mockGetManagedConnectionsError = null;
     await McpConnectionContext.resetGlobalCache();
   });
 
@@ -55,7 +99,7 @@ describe("MCP Next.js Route Integration (/api/mcp)", () => {
     expect(body.server).toBe("libredb-studio-mcp");
   });
 
-  test("POST /api/mcp rejeita requisição não autenticada com status 401", async () => {
+  test("POST /api/mcp rejeita requisição não autenticada com status 401 do guardRoute", async () => {
     mockSessionResult = null;
     const req = createMockRequest("/api/mcp", {
       method: "POST",
@@ -66,28 +110,41 @@ describe("MCP Next.js Route Integration (/api/mcp)", () => {
     expect(response.status).toBe(401);
 
     const body = await parseResponseJSON<any>(response);
-    expect(body.error).toBeDefined();
-    expect(body.error.code).toBe(-32000);
-    expect(body.error.message).toContain("Unauthorized");
+    expect(body.error).toBe("Authentication required");
   });
 
-  test("POST /api/mcp aceita autenticação via scoped token header", async () => {
+  test("POST /api/mcp ignora headers de token externos e exige sessão válida do LibreDB", async () => {
     mockSessionResult = null;
-    process.env.MCP_TOKEN = "test-secret-mcp-token-xyz";
 
     const req = createMockRequest("/api/mcp", {
       method: "POST",
       headers: {
-        "x-libredb-mcp-token": "test-secret-mcp-token-xyz",
+        "x-libredb-mcp-token": "arbitrary-token",
+        Authorization: "Bearer arbitrary-token",
       },
       body: { jsonrpc: "2.0", id: 10, method: "ping" },
+    });
+
+    const response = await POST(req as any);
+    expect(response.status).toBe(401);
+
+    const body = await parseResponseJSON<any>(response);
+    expect(body.error).toBe("Authentication required");
+  });
+
+  test("POST /api/mcp aceita requisição com sessão autenticada de usuário", async () => {
+    mockSessionResult = { role: "user", username: "regular_user" };
+
+    const req = createMockRequest("/api/mcp", {
+      method: "POST",
+      body: { jsonrpc: "2.0", id: 11, method: "ping" },
     });
 
     const response = await POST(req as any);
     expect(response.status).toBe(200);
 
     const body = await parseResponseJSON<any>(response);
-    expect(body.id).toBe(10);
+    expect(body.id).toBe(11);
     expect(body.result).toEqual({});
   });
 
@@ -153,9 +210,9 @@ describe("MCP Next.js Route Integration (/api/mcp)", () => {
     expect(body.result.content).toBeArray();
 
     const data = JSON.parse(body.result.content[0].text);
-    expect(data.length).toBe(2);
-    expect(data[0].id).toBe("demo-pg");
-    expect(data[0].engine).toBe("postgres");
+    expect(data.length).toBe(3);
+    expect(data.some((c: any) => c.id === "demo-pg")).toBe(true);
+    expect(data.some((c: any) => c.id === "demo-sqlite")).toBe(true);
   });
 
   test("POST /api/mcp executa 'tools/call' para 'run_read_query' com sucesso e paginação", async () => {
@@ -190,6 +247,55 @@ describe("MCP Next.js Route Integration (/api/mcp)", () => {
     expect(data.pagination).toBeDefined();
     expect(data.pagination.limit).toBe(100);
     expect(data.pagination.hasMore).toBe(false);
+  });
+
+  test("POST /api/mcp recusa perfil para SQLite :memory: sem fallback para provider gravável", async () => {
+    const req = createMockRequest("/api/mcp", {
+      method: "POST",
+      body: {
+        jsonrpc: "2.0",
+        id: "refuse-memory-1",
+        method: "tools/call",
+        params: {
+          name: "run_read_query",
+          arguments: {
+            connection_id: "demo-sqlite-memory",
+            sql: "SELECT 1",
+          },
+        },
+      },
+    });
+
+    const response = await POST(req as any);
+    expect(response.status).toBe(200);
+
+    const body = await parseResponseJSON<any>(response);
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0].text).toContain("cannot target an in-memory SQLite database");
+  });
+
+  test("POST /api/mcp recusa inspect_schema em SQLite :memory: sem fallback", async () => {
+    const req = createMockRequest("/api/mcp", {
+      method: "POST",
+      body: {
+        jsonrpc: "2.0",
+        id: "refuse-inspect-1",
+        method: "tools/call",
+        params: {
+          name: "inspect_schema",
+          arguments: {
+            connection_id: "demo-sqlite-memory",
+          },
+        },
+      },
+    });
+
+    const response = await POST(req as any);
+    expect(response.status).toBe(200);
+
+    const body = await parseResponseJSON<any>(response);
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0].text).toContain("cannot target an in-memory SQLite database");
   });
 
   test("POST /api/mcp rejeita instrução destrutiva no 'run_read_query' com isError: true", async () => {
@@ -269,7 +375,6 @@ describe("MCP Next.js Route Integration (/api/mcp)", () => {
     };
 
     McpConnectionContext.setCachedProvider("demo-sqlite", "agent-read-only", mockAsyncProvider as any);
-    McpConnectionContext.setCachedProvider("demo-sqlite", undefined, mockAsyncProvider as any);
 
     // Dispara POST 1 com query de longa duração
     const req1 = createMockRequest("/api/mcp", {
@@ -335,15 +440,32 @@ describe("MCP Next.js Route Integration (/api/mcp)", () => {
   });
 
   test("POST /api/mcp captura erro em getManagedConnections e segue com conexões vazias", async () => {
-    mockGetManagedConnectionsThrow = true;
+    const secret = "synthetic_managed_connection_secret";
+    mockGetManagedConnectionsError = new Error(`Simulated managed connections failure: password=${secret}`);
+    const warnings: Array<{ message: string; context: any }> = [];
+    const warnSpy = spyOn(logger, "warn").mockImplementation((message, context) => {
+      warnings.push({ message, context });
+    });
     const req = createMockRequest("/api/mcp", {
       method: "POST",
       body: { jsonrpc: "2.0", id: "ping-fallback", method: "ping" },
     });
-    const response = await POST(req as any);
-    expect(response.status).toBe(200);
-    const body = await parseResponseJSON<any>(response);
-    expect(body.id).toBe("ping-fallback");
+    try {
+      const response = await POST(req as any);
+      expect(response.status).toBe(200);
+      const body = await parseResponseJSON<any>(response);
+      expect(body.id).toBe("ping-fallback");
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0].message).toBe("Could not load managed connections for MCP session");
+      expect(warnings[0].context.role).toBe("admin");
+      expect(warnings[0].context.error).toBeInstanceOf(Error);
+      expect(warnings[0].context.error).not.toBe(mockGetManagedConnectionsError);
+      expect(warnings[0].context.error.message).toContain("password=[REDACTED]");
+      expect(warnings[0].context.error.message).not.toContain(secret);
+      expect(warnings[0].context.error.stack ?? "").not.toContain(secret);
+    } finally {
+      warnSpy.mockRestore();
+    }
   });
 
   test("POST /api/mcp responde 500 ao ocorrer erro não tratado no dispatcher", async () => {

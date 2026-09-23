@@ -1,42 +1,18 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getSession } from "@/lib/auth";
+import { guardRoute } from "@/lib/api/require-session";
 import { getManagedConnections } from "@/lib/seed";
 import { McpConnectionContext } from "@/lib/mcp/context";
 import { McpDispatcher } from "@/lib/mcp/dispatcher";
 import { McpCancellationManager } from "@/lib/mcp/guards/cancellation";
 import { JSON_RPC_ERRORS } from "@/lib/mcp/types";
+import { redactError } from "@/lib/mcp/serializer";
 import { logger } from "@/lib/logger";
 
 export const dynamic = "force-dynamic";
 
-export const MCP_TOKEN_HEADER = "x-libredb-mcp-token";
-
-/**
- * Ponto de extensão de autenticação (Auth Seam).
- * Suporta autenticação via cookie de sessão do LibreDB Studio e
- * prepara o canal para o scoped token derivado de JWT_SECRET mantido pelo core team (#246).
- */
-async function authenticateMcpRequest(req: NextRequest): Promise<{ authenticated: boolean; role: string }> {
-  const session = await getSession();
-  if (session) {
-    return { authenticated: true, role: session.role };
-  }
-
-  const token = req.headers.get(MCP_TOKEN_HEADER) || req.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
-
-  if (token) {
-    // Se um MCP_TOKEN estático foi configurado em ambiente de teste ou dev:
-    if (process.env.MCP_TOKEN && token === process.env.MCP_TOKEN) {
-      return { authenticated: true, role: "admin" };
-    }
-  }
-
-  return { authenticated: false, role: "none" };
-}
-
 /**
  * GET /api/mcp
- * Descoberta e health check do endpoint MCP do LibreDB Studio.
+ * Endpoint discovery and metadata for LibreDB Studio MCP server.
  */
 export async function GET() {
   return NextResponse.json({
@@ -46,35 +22,25 @@ export async function GET() {
     server: "libredb-studio-mcp",
     version: "0.16.2",
     endpoint: "/api/mcp",
-    auth: ["session", "x-libredb-mcp-token"],
   });
 }
 
-// Gerenciador de cancelamento global compartilhado entre requisições HTTP da rota
+// Shared cancellation manager instance across HTTP requests for this route
 const globalMcpCancellationManager = new McpCancellationManager();
 
 /**
  * POST /api/mcp
- * Manipulador JSON-RPC 2.0 oficial para clientes MCP (Cursor, Claude Code, etc).
+ * Official JSON-RPC 2.0 handler for MCP clients (Cursor, Claude Code, etc).
  */
 export async function POST(req: NextRequest) {
-  // 1. Verificação de Autenticação (Session ou Scoped Token)
-  const auth = await authenticateMcpRequest(req);
-  if (!auth.authenticated) {
-    return NextResponse.json(
-      {
-        jsonrpc: "2.0",
-        id: null,
-        error: {
-          code: -32000,
-          message: "Unauthorized: Authentication required via session cookie or 'x-libredb-mcp-token' header",
-        },
-      },
-      { status: 401 },
-    );
+  // 1. Session verification & Rate Limiting via standard LibreDB guardRoute
+  const guard = await guardRoute({ route: "POST /api/mcp", bucket: "ai", request: req });
+  if ("response" in guard) {
+    return guard.response;
   }
+  const { session } = guard;
 
-  // 2. Leitura do payload JSON-RPC
+  // 2. Read JSON-RPC payload
   let body: unknown;
   try {
     body = await req.json();
@@ -92,16 +58,19 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  // 3. Resolução de conexões disponíveis com base na role autenticada
+  // 3. Resolve accessible connections based on authenticated role
   let connections: any[] = [];
   try {
-    connections = await getManagedConnections([auth.role]);
+    connections = await getManagedConnections([session.role]);
   } catch (err) {
-    logger.warn("Could not load managed connections for MCP session", { role: auth.role, err });
+    logger.warn("Could not load managed connections for MCP session", {
+      role: session.role,
+      error: redactError(err),
+    });
     connections = [];
   }
 
-  // 4. Instanciação do Contexto e Dispatcher MCP com gerenciamento de ciclo de vida e cancelamento cross-request
+  // 4. Instantiate context and dispatcher with cross-request cancellation and caller scoping
   const context = new McpConnectionContext(connections);
   const dispatcher = new McpDispatcher(context, globalMcpCancellationManager);
 
@@ -109,23 +78,25 @@ export async function POST(req: NextRequest) {
     const result = await dispatcher.handle(body, {
       signal: req.signal,
       cancellationManager: globalMcpCancellationManager,
+      callerId: session.username,
     });
 
     if (result === null) {
-      // Notificações JSON-RPC não exigem corpo de resposta
+      // JSON-RPC notifications do not return a response body
       return new NextResponse(null, { status: 204 });
     }
 
     return NextResponse.json(result);
-  } catch (error: any) {
-    logger.error("Unhandled error in MCP route handler", error);
+  } catch (error: unknown) {
+    const safeError = redactError(error);
+    logger.error("Unhandled error in MCP route handler", safeError);
     return NextResponse.json(
       {
         jsonrpc: "2.0",
         id: null,
         error: {
           code: JSON_RPC_ERRORS.INTERNAL_ERROR,
-          message: error?.message || "Internal server error",
+          message: safeError.message,
         },
       },
       { status: 500 },

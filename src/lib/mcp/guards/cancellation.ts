@@ -1,69 +1,99 @@
 import { logger } from "@/lib/logger";
+import { redactErrorMessage } from "../serializer";
 
 interface ActiveQueryHandle {
+  callerId: string;
   requestId: string | number;
   connectionId: string;
   abortController: AbortController;
   cancelDatabaseOperation?: () => Promise<void>;
   startedAt: number;
+  associatedKeys: Set<string>;
 }
 
 /**
- * Gerenciador de cancelamento para o servidor MCP.
- * Mapeia requests ativas e integra com o evento `notifications/cancelled`.
+ * Cancellation manager for the MCP server.
+ * Tracks active requests scoped by caller identity and integrates with the `notifications/cancelled` protocol event.
  */
 export class McpCancellationManager {
-  private activeQueries = new Map<string | number, ActiveQueryHandle>();
+  private activeQueries = new Map<string, ActiveQueryHandle>();
+
+  private toKey(callerId: string, requestId: string | number): string {
+    return JSON.stringify([callerId, typeof requestId, requestId]);
+  }
 
   /**
-   * Registra uma nova operação em andamento
+   * Registers a new running database operation scoped by caller identity.
    */
   public register(
+    callerId: string,
     requestId: string | number,
     connectionId: string,
     cancelDatabaseOperation?: () => Promise<void>,
   ): AbortSignal {
     const abortController = new AbortController();
-    this.activeQueries.set(requestId, {
+    const key = this.toKey(callerId, requestId);
+    const associatedKeys = new Set<string>([key]);
+    this.activeQueries.set(key, {
+      callerId,
       requestId,
       connectionId,
       abortController,
       cancelDatabaseOperation,
       startedAt: Date.now(),
+      associatedKeys,
     });
     return abortController.signal;
   }
 
   /**
-   * Registra um alias para uma query existente, compartilhando o mesmo AbortController
+   * Registers an alias for an existing running query under the same caller identity.
    */
-  public registerAlias(aliasId: string | number, primaryId: string | number): void {
-    const primary = this.activeQueries.get(primaryId);
+  public registerAlias(callerId: string, aliasId: string | number, primaryId: string | number): void {
+    const primary = this.activeQueries.get(this.toKey(callerId, primaryId));
     if (primary) {
-      this.activeQueries.set(aliasId, primary);
+      const aliasKey = this.toKey(callerId, aliasId);
+      primary.associatedKeys.add(aliasKey);
+      this.activeQueries.set(aliasKey, primary);
     }
   }
 
   /**
-   * Finaliza o registro de uma operação que concluiu
+   * Deregisters a completed operation and purges all of its associated alias keys.
    */
-  public deregister(requestId: string | number): void {
-    this.activeQueries.delete(requestId);
+  public deregister(callerId: string, requestId: string | number): void {
+    const key = this.toKey(callerId, requestId);
+    const handle = this.activeQueries.get(key);
+    if (handle) {
+      for (const k of handle.associatedKeys) {
+        this.activeQueries.delete(k);
+      }
+    } else {
+      this.activeQueries.delete(key);
+    }
   }
 
   /**
-   * Manipula a notificação de cancelamento emitida pelo cliente MCP
+   * Handles a cancellation notification emitted by an authenticated MCP client.
+   * Atomically purges primary and alias keys before running native database cancel.
    */
-  public async handleCancellation(requestId: string | number, reason?: string): Promise<boolean> {
-    const handle = this.activeQueries.get(requestId);
+  public async handleCancellation(callerId: string, requestId: string | number, reason?: string): Promise<boolean> {
+    const key = this.toKey(callerId, requestId);
+    const handle = this.activeQueries.get(key);
     if (!handle) {
       return false;
     }
 
+    // Immediately remove all associated keys (primary and all aliases) to prevent orphan handles or double aborts
+    for (const k of handle.associatedKeys) {
+      this.activeQueries.delete(k);
+    }
+
     logger.info("MCP query cancellation requested by client", {
+      callerId,
       requestId,
       connectionId: handle.connectionId,
-      reason,
+      reason: reason ? redactErrorMessage(reason) : undefined,
       elapsedMs: Date.now() - handle.startedAt,
     });
 
@@ -73,16 +103,19 @@ export class McpCancellationManager {
       try {
         await handle.cancelDatabaseOperation();
       } catch (error) {
-        logger.warn("Failed to cancel native database query on engine", { error, requestId });
+        logger.warn("Failed to cancel native database query on engine", {
+          error: redactErrorMessage(error instanceof Error ? error.message : String(error)),
+          callerId,
+          requestId,
+        });
       }
     }
 
-    this.activeQueries.delete(requestId);
     return true;
   }
 
   /**
-   * Aborta todas as queries em andamento (útil no shutdown gracioso)
+   * Aborts all in-flight queries (used during graceful shutdown).
    */
   public async abortAll(reason = "Server shutdown"): Promise<void> {
     const handles = Array.from(this.activeQueries.values());

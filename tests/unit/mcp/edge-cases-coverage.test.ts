@@ -1,4 +1,4 @@
-import { describe, expect, mock, test } from "bun:test";
+import { describe, expect, mock, spyOn, test } from "bun:test";
 import { McpConnectionContext } from "@/lib/mcp/context";
 import { McpCancellationManager } from "@/lib/mcp/guards/cancellation";
 import { executeListConnections } from "@/lib/mcp/tools/list-connections";
@@ -230,15 +230,71 @@ describe("MCP Edge Cases & Full Line Coverage", () => {
   });
 
   test("McpConnectionContext.disconnectAll captura exceções de providers sem quebrar", async () => {
+    const secret = "synthetic_disconnect_secret";
+    const warnings: string[] = [];
+    const warnSpy = spyOn(console, "warn").mockImplementation((...args) => warnings.push(args.join(" ")));
     const brokenProvider: any = {
       disconnect: async () => {
-        throw new Error("Falha ao desconectar provider remoto");
+        throw Object.assign(new Error("Falha ao desconectar provider remoto"), { password: secret });
       },
     };
     McpConnectionContext.setCachedProvider("broken-conn", undefined, brokenProvider);
 
     const ctx = new McpConnectionContext([dummyConn]);
-    // Não deve lançar erro
-    await expect(ctx.disconnectAll()).resolves.toBeUndefined();
+    try {
+      await expect(ctx.disconnectAll()).resolves.toBeUndefined();
+      expect(warnings.join("\n")).toContain("Error disconnecting provider during MCP shutdown");
+      expect(warnings.join("\n")).not.toContain(secret);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  test("executeInspectSchema trunca mais de 25 índices e corta tabelas quando payload excede 64 KiB", async () => {
+    const manyIndexes = Array.from({ length: 30 }, (_, i) => ({
+      name: `idx_${i}`,
+      columns: ["col_1"],
+      unique: i % 2 === 0,
+    }));
+
+    const mockProvider = {
+      listContainers: async () => [{ name: "main", path: ["main"] }],
+      listObjects: async () => [
+        { name: "table_large_1", path: ["main", "table_large_1"], kind: "table" },
+        { name: "table_large_2", path: ["main", "table_large_2"], kind: "table" },
+        { name: "table_large_3", path: ["main", "table_large_3"], kind: "table" },
+      ],
+      describeObject: async () => ({
+        columns: Array.from({ length: 150 }, (_, i) => ({
+          name: `very_long_column_name_padding_${i}_${"x".repeat(150)}`,
+          type: "VARCHAR(255)",
+          nullable: true,
+        })),
+        indexes: manyIndexes,
+      }),
+    };
+
+    const mockContext: any = {
+      getProvider: async () => mockProvider,
+    };
+
+    const res = await executeInspectSchema(
+      { connection_id: "edge-conn", include_columns: true, include_indexes: true },
+      mockContext,
+    );
+
+    expect(res.isError).toBeUndefined();
+    expect(res.content[0].text).toContain("... [TRUNCATED: 5 additional indexes omitted]");
+    const parsed = JSON.parse(res.content[0].text);
+    expect(parsed.has_more).toBe(true);
+    expect(parsed.tables.length).toBeLessThan(3);
+  });
+
+  test("McpConnectionContext cobre getConnection, closeAll e resetGlobalCache", async () => {
+    const ctx = new McpConnectionContext([dummyConn]);
+    expect(ctx.getConnection("edge-conn")).toEqual(dummyConn);
+    expect(ctx.getConnection("non-existent")).toBeUndefined();
+    await expect(ctx.closeAll()).resolves.toBeUndefined();
+    await expect(McpConnectionContext.resetGlobalCache()).resolves.toBeUndefined();
   });
 });

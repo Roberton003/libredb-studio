@@ -1,7 +1,7 @@
 import type { McpConnectionContext } from "../context";
 import type { McpCancellationManager } from "../guards/cancellation";
 import { assertReadOnlyStatement } from "../guards/execution-fence";
-import { safeJsonStringify, safeSerialize } from "../serializer";
+import { safeJsonStringify, safeSerialize, redactErrorMessage } from "../serializer";
 import {
   type McpCallResult,
   type QueryResultEnvelope,
@@ -13,13 +13,14 @@ const MAX_PAYLOAD_BYTES = 64 * 1024; // 64 KB teto defensivo para LLMs
 
 export interface RunReadQueryOptions {
   requestId?: string | number | null;
+  callerId?: string | null;
   signal?: AbortSignal;
   cancellationManager?: McpCancellationManager;
 }
 
 /**
- * Executa uma consulta SQL em modo estritamente leitura protegida por acquireExecutionProfileProvider
- * e orçamento rigoroso de linhas, bytes e paginação 0.16.2.
+ * Executes a read-only SQL query protected by acquireExecutionProfileProvider
+ * and strict row, payload, and pagination limits.
  */
 export async function executeRunReadQuery(
   rawArgs: unknown,
@@ -31,12 +32,13 @@ export async function executeRunReadQuery(
 
   // 0. Se a requisição já foi abortada pelo cliente antes de iniciar
   if (signal?.aborted) {
+    const reason = signal.reason || "Client cancelled request";
     return {
       isError: true,
       content: [
         {
           type: "text",
-          text: `Execution cancelled: ${signal.reason || "Client cancelled request"}`,
+          text: `Execution cancelled: ${redactErrorMessage(reason instanceof Error ? reason.message : String(reason))}`,
         },
       ],
     };
@@ -57,40 +59,47 @@ export async function executeRunReadQuery(
     };
   }
 
-  const rawReqId = opts?.requestId !== undefined && opts?.requestId !== null ? String(opts.requestId) : null;
-  const queryId = `mcp_${rawReqId ?? crypto.randomUUID()}`;
+  const reqId = opts?.requestId !== undefined && opts?.requestId !== null ? opts.requestId : crypto.randomUUID();
+  const callerId = opts?.callerId || "anonymous";
   let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+  let onParentAbort: (() => void) | undefined;
+  let onAbortReject: (() => void) | undefined;
+  let cancelSignal: AbortSignal | undefined;
+  let providerRef: any = null;
 
   try {
-    // 1. Cerca de Execução Fail-Closed (Defesa em Profundidade: AST / Regex)
+    // 1. Fail-closed execution fence (Defense in depth: AST / Regex)
     assertReadOnlyStatement(args.sql);
 
-    // 2. Barreira Canônica: acquireExecutionProfileProvider com perfil "agent-read-only"
-    const connConfig =
-      typeof context.getConnection === "function" ? context.getConnection(args.connection_id) : undefined;
-    const isMemoryTarget =
-      connConfig?.type === "sqlite" && (!connConfig.database || connConfig.database === ":memory:");
+    // Register in cancellationManager BEFORE provider acquisition so early cancellation is captured
+    if (cancellationManager) {
+      cancelSignal = cancellationManager.register(callerId, reqId, args.connection_id, async () => {
+        if (providerRef && typeof providerRef.cancelQuery === "function") {
+          await providerRef.cancelQuery(reqId);
+        }
+      });
 
-    let provider: any;
-    try {
-      provider = await context.getProvider(args.connection_id, "agent-read-only");
-    } catch (err: any) {
-      // Apenas conexões comprovadamente SQLite em memória (:memory:) que reportam incompatibilidade tipada usam fallback (#328)
-      if (isMemoryTarget && err?.reasonCode === "PROFILE_UNSUPPORTED_TARGET") {
-        provider = await context.getProvider(args.connection_id);
-      } else {
-        throw err;
+      if (signal) {
+        onParentAbort = () => {
+          void cancellationManager.handleCancellation(callerId, reqId, signal.reason);
+        };
+        signal.addEventListener("abort", onParentAbort, { once: true });
       }
     }
 
+    // 2. Canonical boundary: acquireExecutionProfileProvider with "agent-read-only" profile
+    const provider = await context.getProvider(args.connection_id, "agent-read-only");
+    providerRef = provider;
+
     // Se o cliente abortou durante a inicialização/conexão do provider
-    if (signal?.aborted) {
+    if (signal?.aborted || cancelSignal?.aborted) {
+      const reason = cancelSignal?.reason || signal?.reason || "Client cancelled request";
       return {
         isError: true,
         content: [
           {
             type: "text",
-            text: `Execution cancelled: ${signal.reason || "Client cancelled request"}`,
+            text: `Execution cancelled: ${redactErrorMessage(reason instanceof Error ? reason.message : String(reason))}`,
           },
         ],
       };
@@ -98,85 +107,52 @@ export async function executeRunReadQuery(
 
     const startTime = Date.now();
 
-    // Registrar no cancellationManager se disponível (mapeando queryId e rawReqId para resolução cruzada)
-    let cancelSignal: AbortSignal | undefined;
-    if (cancellationManager) {
-      const cancelDatabaseOperation = async () => {
-        if (provider && typeof (provider as any).cancelQuery === "function") {
-          await (provider as any).cancelQuery(queryId);
-        }
-      };
-      cancelSignal = cancellationManager.register(queryId, args.connection_id, cancelDatabaseOperation);
-      if (rawReqId && rawReqId !== queryId) {
-        cancellationManager.registerAlias(rawReqId, queryId);
-      }
-
-      if (signal) {
-        signal.addEventListener(
-          "abort",
-          () => {
-            cancellationManager.handleCancellation(queryId, signal.reason);
-            if (rawReqId) {
-              cancellationManager.handleCancellation(rawReqId, signal.reason);
-            }
-          },
-          { once: true },
-        );
-      }
-    }
-
-    // 3. Preparação com Paginação (Contrato 0.16.2 / #816)
+    // 3. Query preparation with pagination (Contract 0.16.2 / #816)
     const prepared =
       typeof provider.prepareQuery === "function"
         ? provider.prepareQuery(args.sql, { limit: args.max_rows })
         : { query: args.sql, limit: args.max_rows, offset: 0, wasLimited: false };
 
-    // 4. Execução protegida com timeout e promessa de cancelamento imediato (Fail-Fast)
-    let rawResult: any;
-
+    // 4. Protected execution with timeout
     const timeoutPromise = new Promise((_, reject) => {
       timeoutHandle = setTimeout(() => {
         if (cancellationManager) {
-          cancellationManager.handleCancellation(queryId, `Timeout after ${args.timeout_ms}ms`);
-          if (rawReqId) cancellationManager.handleCancellation(rawReqId, `Timeout after ${args.timeout_ms}ms`);
+          void cancellationManager.handleCancellation(callerId, reqId, `Timeout after ${args.timeout_ms}ms`);
         }
-        reject(new Error(`Query timed out after ${args.timeout_ms}ms`));
+        reject(new Error(`Query execution timed out after ${args.timeout_ms}ms`));
       }, args.timeout_ms);
     });
 
     const abortPromise = new Promise<never>((_, reject) => {
-      const onAbort = () => {
+      onAbortReject = () => {
         const reason = cancelSignal?.reason || signal?.reason || "Query cancelled";
         const message = reason instanceof Error ? reason.message : String(reason);
-        reject(new Error(`Execution cancelled: ${message}`));
+        reject(new Error(`Execution cancelled: ${redactErrorMessage(message)}`));
       };
 
-      if (signal?.aborted) return onAbort();
-      if (cancelSignal?.aborted) return onAbort();
+      if (signal?.aborted) return onAbortReject();
+      if (cancelSignal?.aborted) return onAbortReject();
 
-      signal?.addEventListener("abort", onAbort, { once: true });
-      cancelSignal?.addEventListener("abort", onAbort, { once: true });
+      signal?.addEventListener("abort", onAbortReject, { once: true });
+      cancelSignal?.addEventListener("abort", onAbortReject, { once: true });
     });
 
-    // Se o provider tiver suporte nativo ao perfil read-only do banco (#328), executa nativamente
-    if ((provider as any).readOnlyProfile === true && typeof provider.queryReadOnly === "function") {
-      rawResult = await Promise.race([
-        provider.queryReadOnly(prepared.query, {
-          maxResultRows: prepared.limit,
-          statementTimeoutMs: args.timeout_ms,
-          maxResultBytes: MAX_PAYLOAD_BYTES,
-        }),
-        timeoutPromise,
-        abortPromise,
-      ]);
-    } else {
-      // Fallback para query padrão protegida (bancos em memória ou sem perfil nativo)
-      rawResult = await Promise.race([
-        provider.query(prepared.query, undefined, queryId),
-        timeoutPromise,
-        abortPromise,
-      ]);
+    // Validate that the provider explicitly supports the database-native readOnlyProfile (#328)
+    if ((provider as any).readOnlyProfile !== true || typeof provider.queryReadOnly !== "function") {
+      throw new Error(
+        `Provider for connection "${args.connection_id}" does not support database-native read-only execution profile`,
+      );
     }
+
+    const rawResult: any = await Promise.race([
+      provider.queryReadOnly(prepared.query, {
+        maxResultRows: prepared.limit,
+        statementTimeoutMs: args.timeout_ms,
+        maxResultBytes: MAX_PAYLOAD_BYTES,
+      }),
+      timeoutPromise,
+      abortPromise,
+    ]);
 
     const executionTimeMs = Date.now() - startTime;
     const rawRows = (rawResult.rows || []) as Array<Record<string, unknown>>;
@@ -244,17 +220,18 @@ export async function executeRunReadQuery(
         txt = safeJsonStringify(env, 2);
       }
       const finalBytes = Buffer.byteLength(txt, "utf-8");
-      return { env, txt, wireBytes: finalBytes };
+      const outerWireBytes = Buffer.byteLength(JSON.stringify(txt), "utf-8");
+      return { env, txt, wireBytes: Math.max(finalBytes, outerWireBytes) };
     };
 
     let candidate = buildEnvelopeCandidate(safeRows, fields, truncated);
 
     if (candidate.wireBytes > MAX_PAYLOAD_BYTES) {
-      // Passo A: Se houver mais de 50 colunas nos metadados, limita fields para proteger o wire budget
+      // Step A: If more than 50 metadata fields exist, cap them to protect the wire budget
       if (fields && fields.length > 50) {
         fields = [
           ...fields.slice(0, 50),
-          { name: `... [TRUNCATED: ${fields.length - 50} colunas adicionais omitidas]` },
+          { name: `... [TRUNCATED: ${fields.length - 50} additional columns omitted]` },
         ];
         truncated = true;
         candidate = buildEnvelopeCandidate(safeRows, fields, truncated);
@@ -286,17 +263,17 @@ export async function executeRunReadQuery(
         }
       }
 
-      // Passo D: Se ainda ultrapassar 64 KiB, poda colunas excedentes nas linhas e metadados
+      // Step D: If still exceeding 64 KiB, prune excess columns in rows and metadata
       if (candidate.wireBytes > MAX_PAYLOAD_BYTES && safeRows.length > 0) {
         safeRows = safeRows.map((row) => {
           const entries = Object.entries(row);
           const cappedEntries = entries.slice(0, Math.min(entries.length, 25));
           const trimmed: Record<string, unknown> = Object.fromEntries(cappedEntries);
-          trimmed["_truncation_warning"] = "[TRUNCATED: colunas excedentes omitidas para respeitar o teto de 64 KB]";
+          trimmed["_truncation_warning"] = "[TRUNCATED: excess columns omitted to respect 64 KB wire budget]";
           return trimmed;
         });
         if (fields && fields.length > 25) {
-          fields = [...fields.slice(0, 25), { name: "... [TRUNCATED: colunas excedentes omitidas]" }];
+          fields = [...fields.slice(0, 25), { name: "... [TRUNCATED: excess columns omitted]" }];
         }
         truncated = true;
         candidate = buildEnvelopeCandidate(safeRows, fields, truncated);
@@ -317,7 +294,7 @@ export async function executeRunReadQuery(
       content: [
         {
           type: "text",
-          text: `Execution failed: ${error?.message || String(error)}`,
+          text: `Execution failed: ${redactErrorMessage(error?.message || String(error))}`,
         },
       ],
     };
@@ -325,33 +302,15 @@ export async function executeRunReadQuery(
     if (timeoutHandle) {
       clearTimeout(timeoutHandle);
     }
+    if (signal && onParentAbort) {
+      signal.removeEventListener("abort", onParentAbort);
+    }
+    if (onAbortReject) {
+      signal?.removeEventListener("abort", onAbortReject);
+      cancelSignal?.removeEventListener("abort", onAbortReject);
+    }
     if (cancellationManager) {
-      cancellationManager.deregister(queryId);
-      if (rawReqId) {
-        cancellationManager.deregister(rawReqId);
-      }
+      cancellationManager.deregister(callerId, reqId);
     }
   }
-}
-
-/**
- * Registra a ferramenta `run_read_query` no McpServer (SDK STDIO)
- */
-export function registerRunReadQueryTool(
-  server: any,
-  context: McpConnectionContext,
-  cancellationManager?: McpCancellationManager,
-): void {
-  server.tool(
-    "run_read_query",
-    "Executa uma consulta SQL em modo estritamente leitura (SELECT / WITH) com orçamento rigoroso de linhas e bytes",
-    RunReadQueryInputSchema.shape,
-    async (args: RunReadQueryInput, extra?: any) => {
-      return executeRunReadQuery(args, context, {
-        requestId: extra?.requestId,
-        signal: extra?.signal,
-        cancellationManager,
-      });
-    },
-  );
 }

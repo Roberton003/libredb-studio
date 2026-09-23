@@ -1,8 +1,9 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, spyOn } from "bun:test";
 import { McpConnectionContext } from "@/lib/mcp/context";
 import { McpDispatcher } from "@/lib/mcp/dispatcher";
 import { McpCancellationManager } from "@/lib/mcp/guards/cancellation";
 import { JSON_RPC_ERRORS } from "@/lib/mcp/types";
+import { logger } from "@/lib/logger";
 import type { DatabaseConnection } from "@/lib/db/types";
 
 describe("MCP Dispatcher (JSON-RPC 2.0 Engine)", () => {
@@ -182,17 +183,139 @@ describe("MCP Dispatcher (JSON-RPC 2.0 Engine)", () => {
 
   test("processa notificação notifications/cancelled chamando cancellationManager", async () => {
     let cancelled = false;
-    cancellationManager.register("test-req-1", "conn-x", async () => {
+    cancellationManager.register("test-user", "test-req-1", "conn-x", async () => {
       cancelled = true;
     });
 
-    const response = await dispatcher.handle({
-      jsonrpc: "2.0",
-      method: "notifications/cancelled",
-      params: { requestId: "test-req-1", reason: "User cancelled" },
-    });
+    const response = await dispatcher.handle(
+      {
+        jsonrpc: "2.0",
+        method: "notifications/cancelled",
+        params: { requestId: "test-req-1", reason: "User cancelled" },
+      },
+      { cancellationManager, callerId: "test-user" },
+    );
 
     expect(response).toBeNull();
     expect(cancelled).toBe(true);
+  });
+
+  test("redige credenciais e URIs em mensagens de erro internas capturadas no dispatcher e no logger", async () => {
+    const syntheticPassword = "dummy_test_password";
+    const syntheticToken = "dummy_test_bearer_token";
+
+    const hostileContext = {
+      listPublicConnections: () => {
+        throw new Error("Simulated connection listing error");
+      },
+    } as any;
+
+    const loggedErrors: Array<{ msg: string; err: any; ctx?: any }> = [];
+    const loggedConsoleMessages: string[] = [];
+
+    const loggerErrorSpy = spyOn(logger, "error").mockImplementation((msg, err, ctx) => {
+      loggedErrors.push({ msg, err, ctx });
+    });
+    const consoleErrorSpy = spyOn(console, "error").mockImplementation((...args) => {
+      loggedConsoleMessages.push(args.map(String).join(" "));
+    });
+
+    try {
+      const explodingDispatcher = new McpDispatcher(hostileContext);
+      (explodingDispatcher as any).executeTool = () => {
+        throw new Error(
+          `Fatal driver leak: password=${syntheticPassword} and bearer ${syntheticToken} while connecting to database cluster`,
+        );
+      };
+
+      const explodeResponse = (await explodingDispatcher.handle({
+        jsonrpc: "2.0",
+        id: 1000,
+        method: "tools/call",
+        params: { name: "list_connections" },
+      })) as any;
+
+      // 1. O cliente não recebe o secret
+      expect(explodeResponse.id).toBe(1000);
+      expect(explodeResponse.error.code).toBe(JSON_RPC_ERRORS.INTERNAL_ERROR);
+      expect(explodeResponse.error.message).not.toContain(syntheticPassword);
+      expect(explodeResponse.error.message).not.toContain(syntheticToken);
+      expect(JSON.stringify(explodeResponse)).not.toContain(syntheticPassword);
+      expect(JSON.stringify(explodeResponse)).not.toContain(syntheticToken);
+
+      // 2. O logger não recebe o secret
+      expect(loggedErrors.length).toBe(1);
+      const logged = loggedErrors[0];
+      expect(logged.msg).toBe("Error dispatching MCP request");
+      expect(logged.ctx).toEqual({ method: "tools/call" });
+      expect(logged.err.message).not.toContain(syntheticPassword);
+      expect(logged.err.message).not.toContain(syntheticToken);
+      if (logged.err.stack) {
+        expect(logged.err.stack).not.toContain(syntheticPassword);
+        expect(logged.err.stack).not.toContain(syntheticToken);
+      }
+      for (const consoleMsg of loggedConsoleMessages) {
+        expect(consoleMsg).not.toContain(syntheticPassword);
+        expect(consoleMsg).not.toContain(syntheticToken);
+      }
+
+      // 3. A mensagem redigida mantém informação diagnóstica útil
+      expect(explodeResponse.error.message).toContain("Fatal driver leak:");
+      expect(explodeResponse.error.message).toContain("password=[REDACTED]");
+      expect(explodeResponse.error.message).toContain("bearer [REDACTED]");
+      expect(explodeResponse.error.message).toContain("while connecting to database cluster");
+      expect(logged.err.message).toContain("Fatal driver leak:");
+      expect(logged.err.message).toContain("password=[REDACTED]");
+      expect(logged.err.message).toContain("bearer [REDACTED]");
+    } finally {
+      loggerErrorSpy.mockRestore();
+      consoleErrorSpy.mockRestore();
+    }
+  });
+
+  test("redige URIs com credenciais e tokens em query string no dispatcher e logger", async () => {
+    const syntheticUriSecret = "dummy_uri_password";
+    const syntheticQueryToken = "dummy_query_token";
+
+    const hostileContext = {
+      listPublicConnections: () => {
+        throw new Error("Simulated connection listing error");
+      },
+    } as any;
+
+    const loggedErrors: Array<{ msg: string; err: any; ctx?: any }> = [];
+    const loggerErrorSpy = spyOn(logger, "error").mockImplementation((msg, err, ctx) => {
+      loggedErrors.push({ msg, err, ctx });
+    });
+
+    try {
+      const explodingDispatcher = new McpDispatcher(hostileContext);
+      (explodingDispatcher as any).executeTool = () => {
+        throw new Error(
+          `Database connection error: postgres://admin:${syntheticUriSecret}@db.internal:5432/corp?token=${syntheticQueryToken}&env=prod`,
+        );
+      };
+
+      const response = (await explodingDispatcher.handle({
+        jsonrpc: "2.0",
+        id: 1001,
+        method: "tools/call",
+        params: { name: "list_connections" },
+      })) as any;
+
+      expect(response.error.code).toBe(JSON_RPC_ERRORS.INTERNAL_ERROR);
+      expect(response.error.message).not.toContain(syntheticUriSecret);
+      expect(response.error.message).not.toContain(syntheticQueryToken);
+      expect(response.error.message).toContain("postgres://[REDACTED]@db.internal:5432/corp?token=[REDACTED]&env=prod");
+
+      expect(loggedErrors.length).toBe(1);
+      expect(loggedErrors[0].err.message).not.toContain(syntheticUriSecret);
+      expect(loggedErrors[0].err.message).not.toContain(syntheticQueryToken);
+      expect(loggedErrors[0].err.message).toContain(
+        "postgres://[REDACTED]@db.internal:5432/corp?token=[REDACTED]&env=prod",
+      );
+    } finally {
+      loggerErrorSpy.mockRestore();
+    }
   });
 });

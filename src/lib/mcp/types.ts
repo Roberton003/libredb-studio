@@ -1,8 +1,7 @@
 import { z } from "zod";
-import type { DatabaseConnection } from "@/lib/db/types";
 
 // ============================================================================
-// Schemas e Tipos para list_connections
+// Schemas and Types for list_connections
 // ============================================================================
 
 export const ListConnectionsInputSchema = z.object({
@@ -21,11 +20,11 @@ export interface PublicConnectionMetadata {
 }
 
 // ============================================================================
-// Schemas e Tipos para inspect_schema
+// Schemas and Types for inspect_schema
 // ============================================================================
 
 export const InspectSchemaInputSchema = z.object({
-  connection_id: z.string().min(1, "connection_id é obrigatório"),
+  connection_id: z.string().min(1, "connection_id is required"),
   schema: z.string().optional(),
   table: z.string().optional(),
   limit: z.number().int().min(1).max(100).default(50),
@@ -64,12 +63,12 @@ export interface SchemaInspectionResult {
 }
 
 // ============================================================================
-// Schemas e Tipos para run_read_query
+// Schemas and Types for run_read_query
 // ============================================================================
 
 export const RunReadQueryInputSchema = z.object({
-  connection_id: z.string().min(1, "connection_id é obrigatório"),
-  sql: z.string().min(1, "SQL não pode ser vazio"),
+  connection_id: z.string().min(1, "connection_id is required"),
+  sql: z.string().min(1, "SQL cannot be empty"),
   max_rows: z.number().int().min(1).max(500).default(100),
   timeout_ms: z.number().int().min(500).max(30000).default(10000),
 });
@@ -94,20 +93,7 @@ export interface QueryResultEnvelope {
 }
 
 // ============================================================================
-// Configuração do Servidor MCP
-// ============================================================================
-
-export interface McpServerConfig {
-  serverName?: string;
-  serverVersion?: string;
-  connections?: DatabaseConnection[];
-  connectionsProvider?: () => Promise<DatabaseConnection[]> | DatabaseConnection[];
-  defaultQueryTimeoutMs?: number;
-  maxQueryRowsCeiling?: number;
-}
-
-// ============================================================================
-// Protocolo JSON-RPC 2.0 & MCP
+// JSON-RPC 2.0 & MCP Protocol
 // ============================================================================
 
 export type JsonRpcId = string | number | null;
