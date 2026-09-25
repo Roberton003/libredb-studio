@@ -10,7 +10,6 @@ import { emitAuditEvent } from "@/lib/audit";
 import { randomUUID } from "node:crypto";
 
 export interface InspectSchemaOptions {
-  requestId?: string | number | null;
   callerId?: string | null;
 }
 

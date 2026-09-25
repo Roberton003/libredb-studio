@@ -289,7 +289,6 @@ export class McpDispatcher {
 
       case "inspect_schema":
         return executeInspectSchema(args, this.context, {
-          requestId,
           callerId: requestContext?.callerId,
         });
 
