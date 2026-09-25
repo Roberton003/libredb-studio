@@ -34,6 +34,7 @@ describe("MCP Edge Cases & Full Line Coverage", () => {
       describeObject: async () => {
         if (describeThrows) throw new Error("Describe failed");
         return {
+          comment: "Users table comment",
           columns: [
             { name: "id", type: "INTEGER", nullable: false, defaultValue: 1, isPrimary: true },
             { name: "username", type: "TEXT", nullable: true },
@@ -303,17 +304,40 @@ describe("MCP Edge Cases & Full Line Coverage", () => {
     const unsupportingProvider = {
       readOnlyProfile: true,
       getCapabilities: () => ({ supportsResultPagination: false }),
-      prepareQuery: (sql: string, opts: any) => ({ query: sql, limit: opts.limit, offset: opts.offset, wasLimited: false }),
+      prepareQuery: (sql: string, opts: any) => ({
+        query: sql,
+        limit: opts.limit,
+        offset: opts.offset,
+        wasLimited: false,
+      }),
       queryReadOnly: async () => ({ rows: [], fields: [] }),
     };
     const mockContext: any = {
       getProvider: async () => unsupportingProvider,
     };
-    const res = await executeRunReadQuery(
-      { connection_id: "edge-conn", sql: "SELECT 1", offset: 10 },
-      mockContext,
-    );
+    const res = await executeRunReadQuery({ connection_id: "edge-conn", sql: "SELECT 1", offset: 10 }, mockContext);
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toContain("does not support result pagination (offset)");
+  });
+
+  test("executeRunReadQuery accepts positive offset when provider supports result pagination", async () => {
+    const supportingProvider = {
+      readOnlyProfile: true,
+      getCapabilities: () => ({ supportsResultPagination: true }),
+      prepareQuery: (sql: string, opts: any) => ({
+        query: sql,
+        limit: opts.limit,
+        offset: opts.offset,
+        wasLimited: false,
+      }),
+      queryReadOnly: async () => ({ rows: [{ id: 1 }], fields: [{ name: "id" }] }),
+    };
+    const mockContext: any = {
+      getProvider: async () => supportingProvider,
+    };
+    const res = await executeRunReadQuery({ connection_id: "edge-conn", sql: "SELECT 1", offset: 10 }, mockContext);
+    expect(res.isError).toBeFalsy();
+    expect(res.content[0].text).toContain('"id": 1');
+    expect(res.content[0].text).toContain('"offset": 10');
   });
 });

@@ -119,9 +119,7 @@ export async function executeRunReadQuery(
         typeof provider.prepareQuery === "function";
 
       if (!supportsPagination) {
-        throw new Error(
-          `Provider for connection "${args.connection_id}" does not support result pagination (offset)`,
-        );
+        throw new Error(`Provider for connection "${args.connection_id}" does not support result pagination (offset)`);
       }
     }
 

@@ -78,20 +78,16 @@ export async function POST(req: NextRequest) {
       const decision = consumeRateLimit("query", session.username);
       if (!decision.allowed) {
         if (decision.tripped) {
-          try {
-            emitAuditEvent({
-              type: "rate_limit_exceeded",
-              action: "throttled",
-              target: "POST /api/mcp",
-              user: session.username,
-              result: "failure",
-              reason: "rate_limited",
-              ip: clientAddress(req),
-              bucket: "query",
-            });
-          } catch (auditError) {
-            logger.error("Failed to record rate_limit_exceeded audit event", auditError, { route: "POST /api/mcp" });
-          }
+          emitAuditEvent({
+            type: "rate_limit_exceeded",
+            action: "throttled",
+            target: "POST /api/mcp",
+            user: session.username,
+            result: "failure",
+            reason: "rate_limited",
+            ip: clientAddress(req),
+            bucket: "query",
+          });
         }
         return createErrorResponse(new RateLimitError(decision.retryAfterSeconds), { route: "POST /api/mcp" });
       }

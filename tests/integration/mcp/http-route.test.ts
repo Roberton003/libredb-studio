@@ -600,4 +600,37 @@ describe("MCP Next.js Route Integration (/api/mcp)", () => {
     expect(throttledEvents[0].bucket).toBe("query");
     expect(throttledEvents[0].user).toBe("admin");
   });
+
+  test("POST /api/mcp allows batch database calls when within rate limit budget", async () => {
+    clearRateLimitState();
+    const req = createMockRequest("/api/mcp", {
+      method: "POST",
+      body: [
+        {
+          jsonrpc: "2.0",
+          id: "batch-allowed-1",
+          method: "tools/call",
+          params: {
+            name: "run_read_query",
+            arguments: { connection_id: "demo-sqlite", sql: "SELECT 1" },
+          },
+        },
+        {
+          jsonrpc: "2.0",
+          id: "batch-allowed-2",
+          method: "tools/call",
+          params: {
+            name: "run_read_query",
+            arguments: { connection_id: "demo-sqlite", sql: "SELECT 2" },
+          },
+        },
+      ],
+    });
+
+    const response = await POST(req as any);
+    expect(response.status).toBe(200);
+    const data = await response.json();
+    expect(Array.isArray(data)).toBe(true);
+    expect(data.length).toBe(2);
+  });
 });
