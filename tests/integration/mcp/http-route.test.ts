@@ -559,6 +559,34 @@ describe("MCP Next.js Route Integration (/api/mcp)", () => {
     expect(schemaEvent?.correlationId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
   });
 
+  test("POST /api/mcp gives two calls that reuse one JSON-RPC id distinct audit correlation ids", async () => {
+    const calls = [
+      { name: "run_read_query", arguments: { connection_id: "demo-sqlite", sql: "SELECT 1 AS one" } },
+      { name: "inspect_schema", arguments: { connection_id: "demo-sqlite" } },
+    ];
+
+    for (const params of calls) {
+      getServerAuditBuffer().clear();
+
+      for (let i = 0; i < 2; i++) {
+        const req = createMockRequest("/api/mcp", {
+          method: "POST",
+          body: { jsonrpc: "2.0", id: 1, method: "tools/call", params },
+        });
+        const response = await POST(req as any);
+        expect(response.status).toBe(200);
+      }
+
+      const correlationIds = getServerAuditBuffer()
+        .filter({ type: "agent_operation" })
+        .filter((e) => e.action === params.name && e.target === "demo-sqlite")
+        .map((e) => e.correlationId);
+      expect(correlationIds).toHaveLength(2);
+      expect(correlationIds.every((id) => typeof id === "string")).toBe(true);
+      expect(new Set(correlationIds).size).toBe(2);
+    }
+  });
+
   test("POST /api/mcp meters batch database calls against query bucket and throttles with 429 when exhausted", async () => {
     clearRateLimitState();
     getServerAuditBuffer().clear();
