@@ -37,7 +37,7 @@ Add the endpoint as a remote HTTP MCP server using the configuration format supp
 - Use HTTPS in production and restrict network access to trusted clients.
 - Use a least-privilege Studio account.
 - Never commit cookies, bearer credentials, or generated client configuration containing secrets.
-- Unauthenticated requests through Studio reverse proxy/middleware receive an HTTP 307 redirect to `/login`. Direct calls without a valid session cookie receive `401 Authentication required`.
+- Unauthenticated requests through Studio reverse proxy/middleware receive an HTTP 307 redirect to `/login`.
 - `429` indicates the query rate limit bucket was reached.
 - Batch requests are supported up to 50 requests per batch with a 64 KiB wire budget. If a batch exceeds the budget, overflowing responses are returned with per-ID JSON-RPC errors rather than silently dropped.
 - The `offset` parameter in `run_read_query` is supported when the underlying provider declares pagination support (`supportsResultPagination`). A positive offset on an unsupported provider returns an error. Deterministic ordering (`ORDER BY`) is recommended for stable pagination.

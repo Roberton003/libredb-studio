@@ -129,14 +129,15 @@ const BUCKETS: Record<RateLimitBucket, BucketSpec> = {
   // for exactly that and the object half of the count moved: the previous figure was TWENTY-THREE
   // over seven object routes, and the edit surface adds two.
   //
-  // TWENTY-FIVE handlers today, and there are two ways in, which is why one grep under-counts.
-  // Directly, sixteen call sites that pass bucket: "query" to guardRoute themselves
-  // (grep -rl 'bucket: "query"' src/app/api/ answers sixteen files, one call site each, verified
+  // TWENTY-SIX handlers today, and there are three ways in, which is why one grep under-counts.
+  // Directly, seventeen call sites that pass bucket: "query" to guardRoute themselves
+  // (grep -rl 'bucket: "query"' src/app/api/ answers seventeen files, one call site each, verified
   // with grep -rc on the same list): admin/fleet-health, db/cancel, db/disconnect, db/health,
   // db/maintenance, db/monitoring, db/multi-query, db/pool-stats, db/profile, db/provider-meta,
-  // db/query, db/test-connection, db/transaction, and the three storage routes (storage,
+  // db/query, db/test-connection, db/transaction, mcp, and the three storage routes (storage,
   // storage/[collection], storage/migrate). Note db/health: only its POST is metered, because the
-  // GET is the container health probe and takes no connection.
+  // GET is the container health probe and takes no connection. Note also mcp: its route handler
+  // meters batches programmatically via consumeRateLimit("query", ...) per query item.
   // Indirectly, the NINE object routes under db/objects (containers, counts, list, describe,
   // search, inventory, source, edit-plan, edit-apply), which reach this bucket through
   // handleObjectRequest in object-route.ts and so carry no bucket literal of their own. Counted

@@ -9,6 +9,7 @@ import {
   RunReadQueryInputSchema,
 } from "../types";
 import { emitAuditEvent } from "@/lib/audit";
+import { randomUUID } from "node:crypto";
 
 const MAX_PAYLOAD_BYTES = 64 * 1024; // 64 KB defensive ceiling for LLMs
 
@@ -31,6 +32,7 @@ export async function executeRunReadQuery(
   const startTime = Date.now();
   const signal = opts?.signal;
   const cancellationManager = opts?.cancellationManager;
+  const correlationId = randomUUID();
 
   // 0. If request was already aborted by client before starting
   if (signal?.aborted) {
@@ -302,7 +304,7 @@ export async function executeRunReadQuery(
       user: callerId,
       result: "success",
       duration: executionTimeMs,
-      correlationId: reqId !== undefined && reqId !== null ? String(reqId) : undefined,
+      correlationId,
     });
 
     return {
@@ -323,7 +325,7 @@ export async function executeRunReadQuery(
         result: "failure",
         reason: "agent_execution_failed",
         duration: Date.now() - startTime,
-        correlationId: reqId !== undefined && reqId !== null ? String(reqId) : undefined,
+        correlationId,
       });
     }
 

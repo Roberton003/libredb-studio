@@ -523,7 +523,8 @@ describe("MCP Next.js Route Integration (/api/mcp)", () => {
     expect(queryEvent?.user).toBe("admin");
     expect(queryEvent?.result).toBe("success");
     expect(queryEvent?.duration).toBeDefined();
-    expect(queryEvent?.correlationId).toBe("audit-query-1");
+    expect(queryEvent?.correlationId).toBeDefined();
+    expect(queryEvent?.correlationId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
   });
 
   test("POST /api/mcp emits audit event when inspect_schema reaches engine", async () => {
@@ -554,7 +555,8 @@ describe("MCP Next.js Route Integration (/api/mcp)", () => {
     expect(schemaEvent?.user).toBe("admin");
     expect(schemaEvent?.result).toBe("success");
     expect(schemaEvent?.duration).toBeDefined();
-    expect(schemaEvent?.correlationId).toBe("audit-schema-1");
+    expect(schemaEvent?.correlationId).toBeDefined();
+    expect(schemaEvent?.correlationId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
   });
 
   test("POST /api/mcp meters batch database calls against query bucket and throttles with 429 when exhausted", async () => {

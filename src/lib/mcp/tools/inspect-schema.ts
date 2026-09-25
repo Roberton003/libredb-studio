@@ -7,6 +7,7 @@ import {
   type SchemaInspectionResult,
 } from "../types";
 import { emitAuditEvent } from "@/lib/audit";
+import { randomUUID } from "node:crypto";
 
 export interface InspectSchemaOptions {
   requestId?: string | number | null;
@@ -25,7 +26,7 @@ export async function executeInspectSchema(
   const startedAt = Date.now();
   let parsedConnectionId: string | undefined;
   const callerId = opts?.callerId || "anonymous";
-  const correlationId = opts?.requestId !== undefined && opts?.requestId !== null ? String(opts.requestId) : undefined;
+  const correlationId = randomUUID();
 
   try {
     const parsed: InspectSchemaInput = InspectSchemaInputSchema.parse(args || {});
