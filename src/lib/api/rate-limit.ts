@@ -136,8 +136,7 @@ const BUCKETS: Record<RateLimitBucket, BucketSpec> = {
   // db/maintenance, db/monitoring, db/multi-query, db/pool-stats, db/profile, db/provider-meta,
   // db/query, db/test-connection, db/transaction, mcp, and the three storage routes (storage,
   // storage/[collection], storage/migrate). Note db/health: only its POST is metered, because the
-  // GET is the container health probe and takes no connection. Note also mcp: its route handler
-  // meters batches programmatically via consumeRateLimit("query", ...) per query item.
+  // GET is the container health probe and takes no connection.
   // Indirectly, the NINE object routes under db/objects (containers, counts, list, describe,
   // search, inventory, source, edit-plan, edit-apply), which reach this bucket through
   // handleObjectRequest in object-route.ts and so carry no bucket literal of their own. Counted
@@ -145,6 +144,10 @@ const BUCKETS: Record<RateLimitBucket, BucketSpec> = {
   // whole reason this second paragraph exists: those nine carry no literal to find. All nine
   // directories exist; this passage used to say seven did, because the count moved ahead of the
   // last two routes landing, and a reader who counts today gets nine.
+  // And by calling consumeRateLimit("query", ...) with no bucket literal at all, which is what
+  // POST /api/mcp does for a batch: one more slot for each run_read_query or inspect_schema call
+  // after the first, which its guardRoute already charged. That handler is one of the seventeen
+  // above, so this third way adds charges and not a handler.
   //
   // A SLOT IS NOT A UNIT OF COST HERE EITHER, and the two new routes are the sharpest example in
   // this bucket. An edit-apply slot runs DDL against a live engine; a db/pool-stats slot reads a
@@ -152,7 +155,8 @@ const BUCKETS: Record<RateLimitBucket, BucketSpec> = {
   // per cost class would be a configurable pair per route.
   //
   // The same workload reached through a different endpoint must not get a second budget -
-  // re-verify and correct this comment again if guardRoute grows a new call site.
+  // re-verify and correct this comment again if guardRoute or consumeRateLimit("query", ...) grows
+  // a new call site.
   //
   // The storage family joined when AU1 moved it onto the shared 401 (2026-08-22), and that gave it
   // a limiter it never had. It belongs here rather than in a bucket of its own: under
