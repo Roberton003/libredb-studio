@@ -26,12 +26,12 @@
 
 ## Overview
 
-LibreDB Studio provides a RESTful API for database management operations. The API supports PostgreSQL, MySQL, SQLite, libSQL, DuckDB, Oracle, SQL Server, MongoDB, Couchbase, ClickHouse, Apache Druid, Elasticsearch, OpenSearch, Apache Trino, Apache Cassandra and Redis.
+LibreDB Studio provides a RESTful API for database management operations. The API supports PostgreSQL, MySQL, SQLite, libSQL, DuckDB, Oracle, SQL Server, MongoDB, Couchbase, ClickHouse, Apache Druid, Elasticsearch, OpenSearch, Apache Trino, Apache Cassandra, Redis and Prometheus.
 
 ### Key Features
 
 - **JWT Authentication** - Secure token-based authentication stored in HTTP-only cookies
-- **Multi-Database Support** - Sixteen engines: PostgreSQL, MySQL, SQLite, libSQL, DuckDB, Oracle, SQL Server, MongoDB, Couchbase, ClickHouse, Apache Druid, Elasticsearch, OpenSearch, Apache Trino, Apache Cassandra, Redis
+- **Multi-Database Support** - Seventeen engines: PostgreSQL, MySQL, SQLite, libSQL, DuckDB, Oracle, SQL Server, MongoDB, Couchbase, ClickHouse, Apache Druid, Elasticsearch, OpenSearch, Apache Trino, Apache Cassandra, Redis, Prometheus
 - **AI-Powered Insights** - EXPLAIN explanations, query-safety analysis and schema docs, streamed
 - **Real-time Health Monitoring** - Database metrics and performance insights
 
@@ -327,11 +327,48 @@ Execute SQL query on connected database.
 }
 ```
 
-The `pagination` object reports the auto-limiting applied by the server. `limit` is `options.limit` when the caller sent one and 500 otherwise; the app's own tree click sends 50. `wasLimited` is `true` when the server injected a `LIMIT` the query didn't specify.
+The `pagination` object reports the auto-limiting applied by the server.
+`limit` is `options.limit` when the caller sent one and 500 otherwise; the app's own tree click sends 50.
+`wasLimited` is `true` when the server injected a `LIMIT` the query didn't specify, and also when the provider bounded its own result and reported that bound on the result it returned: the Prometheus provider does so whenever it cut the result, at its series cap, at its matrix cell budget or at its result byte budget, and names each cut in a `warnings` entry (#1085, section 5.4).
 
-`hasMore` is `wasLimited && rows.length === limit`, and both halves matter. A statement the server returned **untouched** — one carrying its own `LIMIT n`, or one whose end the limiter declined to cut into — runs identically at every `offset`, because the requested offset is discarded along with the rewrite. `hasMore` is `false` for those however many rows come back, and re-requesting with a higher `offset` would return the same rows again. Where `hasMore` is `true`, re-request with `offset` advanced by the number of rows you received. See [`docs/editor/query-optimization.md`](editor/query-optimization.md).
+`hasMore` is `wasLimited && rows.length === limit` with `wasLimited` read from the server's own limiter alone, and both halves matter.
+A bound the provider reported sets `wasLimited` and never `hasMore`, because no `offset` can advance a bound the server did not write.
+A statement the server returned **untouched** — one carrying its own `LIMIT n`, or one whose end the limiter declined to cut into — runs identically at every `offset`, because the requested offset is discarded along with the rewrite. `hasMore` is `false` for those however many rows come back, and re-requesting with a higher `offset` would return the same rows again. Where `hasMore` is `true`, re-request with `offset` advanced by the number of rows you received. See [`docs/editor/query-optimization.md`](editor/query-optimization.md).
 
-Not every engine can serve a positive `offset`. Cassandra and Elasticsearch answer one with HTTP 400 rather than silently returning page one; MongoDB, Redis and LibreDB ignore it. `GET /api/db/provider-meta` reports each one's `capabilities.supportsResultPagination`, which is the same flag the app reads before offering its Load More control.
+Not every engine can serve a positive `offset`. Cassandra and Elasticsearch answer one with HTTP 400 rather than silently returning page one; MongoDB, Redis, LibreDB and Prometheus ignore it. `GET /api/db/provider-meta` reports each one's `capabilities.supportsResultPagination`, which is the same flag the app reads before offering its Load More control.
+
+**The database a run reads (optional):**
+```json
+{
+  "connectionId": "seed:test-redis-6380",
+  "sql": "GET db1:only:key",
+  "database": 3
+}
+```
+
+`database` is a **non-negative integer** that sits BESIDE the connection, and it is applied *after* the
+connection is resolved — which is the whole reason it is its own field rather than a field of
+`connection`. A managed connection travels as an id and the server discards whatever the caller
+attached to the connection it sent (`resolveConnection`, GHSA-3wh2-8x78), so a `database` merged into
+that object reaches no server on a zero-config deployment and the run falls back to the session's
+database while the caller believes it named another.
+
+The value it carries is the walk's own number: a key lives in exactly one numbered database and
+`GET <key>` cannot name it, so a tab opened under a chosen database sends it here and the statement
+runs where the key is. The connection's own `database` field is not rewritten by it. **Absent** is the
+ordinary case and the one every statement other than a key read sends.
+
+The field is accepted only where the provider declares `keyScan`, because that is the engine for which
+a run cannot name a database in its statement; on any other engine it would be a per-run override of an
+operator-pinned `database` with no walk to justify it, so it is refused rather than quietly honoured.
+The declaration is read without connecting, so the refusal costs no socket and an unreachable host of
+another engine still answers 400:
+
+| Condition | Status | Body |
+|-----------|--------|------|
+| `database` present and not a non-negative integer | `400` | `{ "error": "\"database\" must be a non-negative integer" }` — the same sentence `POST /api/db/keys/scan` refuses with, shared in `optionalDatabase` |
+| The provider declares no `keyScan` | `400` | `{ "error": "<type> declares no key-space walk: \"database\" names the database a key was walked in, and only an engine that needs such a name accepts it" }` |
+| The server has no such database | `400` | `{ "error": "Redis refused database <n>: ERR DB index is out of range", "code": "QUERY_ERROR", "statusCode": 400 }`, never a read of database 0 |
 
 **Bound parameters (optional):**
 ```json
@@ -807,13 +844,93 @@ A `druid` connection fails the second check whatever the `type` is, with `{ "err
 
 A `trino` connection passes it for `kill` and fails it for everything else, which is the difference between an empty supported set and a set of one: `CALL system.runtime.kill_query` really terminates a statement (verified end to end - the target then fails `ADMINISTRATIVELY_KILLED`), while vacuum, reindex, optimize, check and analyze all describe work that belongs to the connector behind a catalog rather than to the engine.
 
+#### POST /api/db/objects/describe
+
+Read the columns, indexes and foreign keys of ONE object.
+
+This is the object tree's per-row read: one request when a reader expands an object row, and none
+before that.
+It executes nothing and writes nothing.
+
+**Authentication:** Required.
+No admin gate, for the same reason the two edit routes below have none: the role decides which
+connection may be OPENED and nothing about what may be read through it.
+
+**Request:**
+```json
+{
+  "connection": { "id": "conn-123", "type": "postgres", "host": "localhost", "port": 5432, "database": "mydb", "user": "app" },
+  "path": ["app", "orders"],
+  "kind": "table"
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `connection` or `connectionId` | object or string | Yes | The same connection selector every database route takes |
+| `path` | string[] | Yes | The object's path, container segments first, then the object's own identifier. An empty array is refused |
+| `kind` | string | Yes | The object kind id, as the CONNECTED provider declares it. Never inferred from the path: without it a provider has to guess what it is holding from whatever the last segment matches in a catalog |
+
+There is no depth check on `path`.
+How deep a kind nests is a per-kind fact the provider declares (a trigger nests under its table),
+and the provider validates the path against that declaration.
+
+**Response (200 OK):** one `ObjectDetail`, exactly as the provider answered it.
+`ColumnSchema`, `IndexSchema` and `ForeignKeySchema` are defined under
+[DatabaseObject](#databaseobject).
+
+```json
+{
+  "path": ["app", "orders"],
+  "columns": [
+    { "name": "id", "type": "integer", "nullable": false, "isPrimary": true },
+    { "name": "total", "type": "numeric(12,2)", "nullable": true, "isPrimary": false, "defaultValue": "0" }
+  ],
+  "indexes": [{ "name": "orders_pkey", "columns": ["id"], "unique": true }],
+  "foreignKeys": [{ "columnName": "customer_id", "referencedTable": "customers", "referencedColumn": "id" }]
+}
+```
+
+Column order is the provider's own order, unchanged by this route: Cassandra answers partition key,
+then clustering columns, then the rest alphabetically, and that ordering reaches the client intact.
+
+A kind that has no columns is a `200` carrying three empty arrays and never a refusal.
+Oracle answers that shape for every kind whose role is not `relation`, MySQL for every kind its own
+column predicate rejects, and a caller is expected to render "nothing to show" rather than treat the
+engine as broken.
+
+**Statuses:**
+
+| Condition | Status | Body |
+|-----------|--------|------|
+| The provider answered | `200` | the `ObjectDetail` above, including the all-empty form |
+| `path` absent, or not an array of strings | `400` | `{ "error": "\"path\" must be an array of path segments" }` |
+| `path` empty | `400` | `{ "error": "\"path\" must name an object, and an empty path names none" }` |
+| `kind` absent, not a string, or blank | `400` | `{ "error": "\"kind\" must be a non-empty string" }` |
+| The engine refused the read: a kind it does not declare, a path shape that kind does not take, a permission error | `400` | `{ "error": "<the engine's own sentence>", "code": "QUERY_ERROR" }` |
+| No session | `401` | `{ "error": "Authentication required" }` |
+| Seed connection not available for the caller's role | `403` | the existing `SeedConnectionError` body |
+| Rate limited | `429` | `{ "error": "...", "code": "RATE_LIMITED" }` |
+| Anything undeclared | `500` | `createErrorResponse`'s body |
+
+**An object dropped between the listing and this read has two answers, and which one you get is a
+SHAPE rather than a count.**
+A provider that checks its catalog read for a zero-row answer refuses with `400` and
+`code: "QUERY_ERROR"`, carrying its own sentence: PostgreSQL's is `No detail row for app.orders`.
+A provider that does not check answers `200` with three empty arrays, which is indistinguishable
+from an object that genuinely has no columns.
+Both are correct answers from this route.
+A client must handle both, and must not read the empty answer as evidence that the object is still
+there.
+
 #### POST /api/db/objects/edit-plan
 
 Build a plan for an edited object definition, and answer what an apply would send.
 It executes nothing and writes nothing.
 
-These two routes are the first object routes documented in this file at all.
-Their seven Phase 2 siblings under `/api/db/objects/` are not documented here yet.
+The describe route above is the one Phase 2 sibling documented in this file.
+The other six under `/api/db/objects/` (`containers`, `counts`, `list`, `search`, `inventory`,
+`source`) are not documented here yet.
 
 **Authentication:** Required.
 There is NO admin gate on either route, and the reason is measured rather than preferred: a
@@ -935,6 +1052,98 @@ Neither event ever carries the statement, the command payload, the reader's text
 engine's message, the engine's code, the revision token or the plan token.
 A plan the seal refuses emits ONE event, with `reason: "object_edit_plan_invalid"`.
 
+#### POST /api/db/keys/scan
+
+One page of a resumable walk of an engine's own **key space**.
+
+This is not an object read and does not replace one. `listObjects` answers a whole folder in one call
+and is finite by definition, which is true of every catalog-backed engine and false of a key space:
+there is no prefix index to enumerate from, so the only way to learn what exists is `SCAN`, and `SCAN`
+answers a cursor rather than a listing. A caller that stops at one page holds a sample, and the only
+way to hold more is to come back with the cursor it was given. That is a different contract, so it is
+a route of its own rather than an option on the object routes.
+
+The walk is offered by an engine that declares `keyScan` in `POST /api/db/provider-meta`'s
+`capabilities`; Redis declares `{ "defaultCount": 500, "maxCount": 1000 }`. Every other connection
+answers `400`, in this route's own words. A provider that declares the capability and implements no
+walk is a distinct `500` rather than a crash: `ProviderCapabilities` is published, so that is a state
+an external implementer can genuinely be in.
+
+**Authentication:** Required.
+No admin gate, for the same reason the object routes have none: the role decides which connection may
+be OPENED and nothing about what may be read through it.
+
+**Request:**
+```json
+{
+  "connection": { "id": "conn-123", "type": "redis", "host": "localhost", "port": 6379 },
+  "cursor": "0",
+  "pattern": "app:cache:*",
+  "count": 500,
+  "database": 0
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `connection` or `connectionId` | object or string | Yes | The same connection selector every database route takes |
+| `cursor` | string | No | The cursor the previous page answered with. Absent means `"0"`, which starts a walk. Refused unless it is a run of digits — Redis cursors are opaque, and only the obviously malformed one is refused here rather than passed through |
+| `pattern` | string | No | A `MATCH` pattern, forwarded verbatim. Absent means every key, which is NOT the same as an empty string: `MATCH ""` is a pattern no key satisfies. Two things a caller scoping a walk has to know. `MATCH` is applied per batch server-side and is **not indexed**, so a scoped walk costs the server a full pass over the keyspace rather than a lookup. And it is a glob with **no escape**, so a key segment that contains `*`, `?` or `[` matches more than the prefix asked about — the answer must be filtered by the caller, compared segment by segment (`app:envelope` is not under `app:env`) |
+| `count` | number | No | The batch size. Absent takes the provider's declared `defaultCount`. A value above the declared `maxCount` is **refused rather than clamped**, because a silent clamp answers a request for 10,000 with 1,000 and says nothing |
+| `database` | number | No | Which numbered database to walk. Absent means the one the session is in, since `SELECT` state lives on the connection and not in this route. A caller offering the choice reads the engine's own list from `POST /api/db/objects/containers` — the same container level the object tree's top level comes from — rather than assuming a count: the same server answers 16 outside cluster mode and 1 inside it |
+
+**Response (200 OK):**
+
+```json
+{
+  "keys": ["app:cache:ttl", "app:cache:user:1"],
+  "cursor": "17",
+  "total": 31,
+  "types": { "app:cache:ttl": "string", "app:cache:user:1": "string" }
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `keys` | The batch. **Not deduplicated and not ordered** — `SCAN` promises neither, so a key present for the whole walk may be returned twice while the table rehashes, and the order is the hash table's rather than the caller's |
+| `cursor` | The cursor for the next page. `"0"` means the walk reached the end, and it is the only end-of-walk signal the engine publishes |
+| `types` | Each key's value type, **by key name**. It travels with the page rather than being asked for separately: `TYPE` takes one key and Redis publishes no batch form, so the provider pipelines one call per key and the cost is ONE extra round trip per page whatever the page holds. A key **absent** from the map is one whose type could not be read and a caller should draw nothing for it; a key that vanished between the walk and this read is present with the server's own `"none"`. What it describes is the moment it was read, like everything else in a sampled walk |
+| `total` | `DBSIZE` for the database walked: the engine's own key count, and the only denominator a progress indicator can divide by, since a cursor says nothing about how much is left. On a clustered deployment it is the LOCAL node's count — `SCAN` walks one node's slots and `DBSIZE` has no cluster-wide form |
+| `clustered` | Present and `true` only when the server's own `INFO cluster` reply says this deployment is clustered. `SCAN` and `DBSIZE` are per node and neither has a cluster-wide form, so on a cluster `keys` and `total` describe the node that answered and nothing else. **Absent** means the deployment does not say it is clustered, which is the ordinary server; a reply the provider could not read is absent rather than a guess. The fact is read in the same round trip as `total` |
+
+The cursor belongs to the CALLER. Nothing is retained between two pages, so a page costs a round trip
+rather than a session, and a cursor arriving after a reconnect is still valid: it is a position in a
+hash table, not a handle.
+
+**Statuses:**
+
+| Condition | Status | Body |
+|-----------|--------|------|
+| The page was read | `200` | the body above |
+| The connection's engine declares no `keyScan` | `400` | `{ "error": "<type> declares no key-space walk: its objects are enumerated from a catalog, so there is nothing to page" }` |
+| `cursor` is present and not a run of digits | `400` | `{ "error": "\"cursor\" must be a decimal cursor the previous page answered with" }` |
+| `pattern` is present but blank | `400` | `{ "error": "\"pattern\" must be a non-empty string" }` |
+| `count` is present and not a positive integer | `400` | `{ "error": "\"count\" must be a positive integer" }` |
+| `count` exceeds the declared `maxCount` | `400` | `{ "error": "\"count\" must be at most <maxCount>, which is the batch size this engine declares" }` |
+| The server has no such database | `400` | `{ "error": "Redis refused database <n>: ERR DB index is out of range", "code": "QUERY_ERROR", "statusCode": 400 }`, never a read of database 0 |
+| `database` is negative or not an integer | `400` | `{ "error": "\"database\" must be a non-negative integer" }` |
+| The engine declares `keyScan` and implements no walk | `500` | `{ "error": "<type> declares keyScan but implements no scanKeysPage" }` |
+| Rate limited | `429` | `{ "error": "...", "code": "RATE_LIMITED" }` |
+
+A failed page does not advance the caller's cursor. The position already held is the last one the
+server acknowledged, so a retry re-asks the batch that failed rather than silently skipping it.
+
+The budget is SHARED and this route carries no bucket of its own: it meters into the `query` bucket
+through the same helper the object routes use, 120 requests per 60 seconds by default, so a person
+driving a walk spends the same allowance their statements do. That is why `Scan all` loops client-side
+on this route rather than asking the server for one unbounded walk.
+
+The sidebar's Keys panel drives this route; what it does with a sample is recorded in the Redis
+provider doc ([§6.2](providers/redis.md#62-the-key-space-walk-panel)). A prefix-scoped walk — the
+panel's Load more row — is this route again with a `pattern` built from the prefix and a cursor that
+belongs to that prefix, so a caller that wants one costs no second contract
+([§6.3](providers/redis.md#63-the-prefix-scoped-walk-load-more)).
+
 ---
 
 ### AI API
@@ -983,7 +1192,7 @@ LLM_API_URL=http://localhost:11434/v1  # For ollama/custom
 
 ### Agent API
 
-eight paths, ten handlers, under `src/app/api/agent/`. They drive the read-only agent runtime — full
+eight paths, eleven handlers, under `src/app/api/agent/`. They drive the read-only agent runtime — full
 behaviour in [`docs/AGENT.md`](AGENT.md), the surface in [`docs/AGENT_GUIDE.md`](AGENT_GUIDE.md), and
 what a run sends to a model provider in [`docs/AGENT_DATA_FLOW.md`](AGENT_DATA_FLOW.md).
 
@@ -1233,6 +1442,21 @@ Requests a stop, and returns the run's status report. Cancellation is enforced b
 persisted state rather than by a driver cancel propagating — so this means *asked to stop*, not *has
 stopped*.
 
+#### PATCH /api/agent/runs/{runId}
+
+Pauses or resumes the run, named by the `action` field: `{"action": "pause"}` or
+`{"action": "resume"}`. Pause lands only on a `running` run; resume only on a `paused` one, and a
+resume that answers `running` also drives the run again in this process.
+
+```json
+// 200 — the run's record after the action
+{ "runId": "arun_…", "status": "paused", "…": "…" }
+```
+
+A refusal is a `409`, never a `500`: the ledger moved between the render and the click (for example,
+a resume that lost the race to the run's end answers the terminal record), or the action cannot be
+honoured. An `action` this route has no words for is a `400`.
+
 #### GET /api/agent/runs/{runId}/stream
 
 The ledger as NDJSON — `content-type: application/x-ndjson; charset=utf-8`, one entry per line, in
@@ -1337,7 +1561,7 @@ Auth required. Merges a client's localStorage payload into server storage on fir
 
 #### GET /api/connections/managed
 
-Auth required. Returns seed/managed connections for the current user's role, with secrets (`password`, `connectionString`) stripped. `cacheHint` is the client cache TTL in ms (`SEED_CACHE_TTL_MS`, default 60000). See [`docs/SEED_CONNECTIONS.md`](SEED_CONNECTIONS.md).
+Auth required. Returns seed/managed connections for the current user's role. A `managed: true` connection has every secret-classified field stripped (`password`, `connectionString`, `apiKeyId`, `apiKeySecret`, `ssl.clientKey`); a `managed: false` one is returned whole, because the browser edits it. `cacheHint` is the client cache TTL in ms (`SEED_CACHE_TTL_MS`, default 60000). See [`docs/SEED_CONNECTIONS.md`](SEED_CONNECTIONS.md).
 
 ```json
 { "connections": [], "cacheHint": 60000 }
@@ -1375,7 +1599,7 @@ Body `{ "connections": [...] }`; returns per-connection health `{ "results": [{ 
 
 ---
 
-> **Internal routes (not part of this public reference).** The frontend also calls several internal `/api/db/*` endpoints that mirror provider internals and change with the UI: `multi-query`, `transaction`, `cancel`, `disconnect`, `test-connection`, `monitoring`, `pool-stats`, `profile`, `provider-meta`, and the object-surface routes under `objects/`. They're auth-gated by the middleware like everything else; consult the route handlers in `src/app/api/db/` for their shapes.
+> **Internal routes (not part of this public reference).** The frontend also calls several internal `/api/db/*` endpoints that mirror provider internals and change with the UI: `multi-query`, `transaction`, `cancel`, `disconnect`, `test-connection`, `monitoring`, `pool-stats`, `profile`, `provider-meta`, and the object-surface routes under `objects/` that are not documented above (`describe`, `edit-plan` and `edit-apply` are). They're auth-gated by the middleware like everything else; consult the route handlers in `src/app/api/db/` for their shapes.
 
 ---
 
@@ -1423,7 +1647,7 @@ interface DatabaseConnection {
   apiKeySecret?: string;   // the pair's secret half; either alone (after trim) falls back to user/password rather than sending a key built from an empty half
 }
 
-type DatabaseType = 'postgres' | 'mysql' | 'sqlite' | 'libsql' | 'duckdb' | 'mongodb' | 'redis' | 'oracle' | 'mssql' | 'libredb' | 'couchbase' | 'clickhouse' | 'druid' | 'elasticsearch' | 'opensearch' | 'trino' | 'cassandra';
+type DatabaseType = 'postgres' | 'mysql' | 'sqlite' | 'libsql' | 'duckdb' | 'mongodb' | 'redis' | 'oracle' | 'mssql' | 'libredb' | 'couchbase' | 'clickhouse' | 'druid' | 'elasticsearch' | 'opensearch' | 'trino' | 'cassandra' | 'prometheus';
 type ConnectionEnvironment = 'production' | 'staging' | 'development' | 'local' | 'other';
 ```
 

@@ -2,6 +2,7 @@ import { describe, test, expect, beforeEach, afterEach, mock, spyOn } from "bun:
 import {
   callerBoundTruncationReason,
   isSourcePartUnavailable,
+  kindHasColumns,
   sourceBoundTruncationReason,
 } from "@/lib/db/object-kinds";
 import type oracledb from "oracledb";
@@ -583,6 +584,123 @@ describe("OracleProvider", () => {
     test("connect creates pool and marks connected", async () => {
       await provider.connect();
       expect(provider.isConnected()).toBe(true);
+    });
+
+    // -------------------------------------------------------------------------
+    // A failed connect must not orphan its pool (#1102).
+    //
+    // `createPool` resolves before anything is dialled in Thin mode, so the
+    // failure lands on the test borrow below and the pool already exists. Dropping
+    // the reference there leaves oracledb's background creator looping toward
+    // `poolMin` with no backoff and nothing able to stop it - measured at ~14,000
+    // connect attempts and one full core per second.
+    //
+    // These four arms count `close` calls rather than assert on `this.pool`
+    // alone: a pool can be unreferenced and still running, which is the defect.
+    // -------------------------------------------------------------------------
+
+    test("a getConnection failure closes the pool it just created", async () => {
+      const closeFn = mock(() => Promise.resolve());
+      const pool = {
+        getConnection: async () => {
+          throw new Error("NJS-503: connection to host 127.0.0.1 port 1521 could not be established");
+        },
+        close: closeFn,
+        connectionsOpen: 0,
+        connectionsInUse: 0,
+      };
+      mockCreatePoolFn = async () => pool;
+
+      await expect(provider.connect()).rejects.toThrow(ConnectionError);
+
+      expect(closeFn).toHaveBeenCalledTimes(1);
+      expect(closeFn).toHaveBeenCalledWith(0);
+      expect(provider.isConnected()).toBe(false);
+    });
+
+    test("the NJS-138 config path closes the pool too", async () => {
+      const closeFn = mock(() => Promise.resolve());
+      const pool = {
+        getConnection: async () => {
+          throw new Error(
+            "NJS-138: connections to this database server version are not supported by node-oracledb in Thin mode",
+          );
+        },
+        close: closeFn,
+        connectionsOpen: 0,
+        connectionsInUse: 0,
+      };
+      mockCreatePoolFn = async () => pool;
+
+      await expect(provider.connect()).rejects.toThrow(DatabaseConfigError);
+
+      expect(closeFn).toHaveBeenCalledTimes(1);
+      expect(closeFn).toHaveBeenCalledWith(0);
+      expect(provider.isConnected()).toBe(false);
+    });
+
+    test("a connect retried after a closed failure creates a new pool", async () => {
+      let createPoolCalls = 0;
+      let failFirst = true;
+
+      mockCreatePoolFn = async () => {
+        createPoolCalls += 1;
+        const shouldFail = failFirst;
+        failFirst = false;
+
+        return {
+          getConnection: async () => {
+            if (shouldFail) {
+              throw new Error("NJS-503: connection to host 127.0.0.1 port 1521 could not be established");
+            }
+            return createMockConnection();
+          },
+          close: async () => {},
+          connectionsOpen: 0,
+          connectionsInUse: 0,
+        };
+      };
+
+      await expect(provider.connect()).rejects.toThrow(ConnectionError);
+      expect(provider.isConnected()).toBe(false);
+
+      // `this.pool` has to be cleared, not just closed. Left set, the `if (this.pool)`
+      // guard at the top of connect() returns without dialling and without an error,
+      // so a caller that retries believes it is connected to nothing.
+      await provider.connect();
+
+      expect(createPoolCalls).toBe(2);
+      expect(provider.isConnected()).toBe(true);
+    });
+
+    test("a close that itself rejects does not replace the connect error", async () => {
+      const closeFn = mock(() => Promise.reject(new Error("NJS-501: connection is busy")));
+
+      mockCreatePoolFn = async () => ({
+        getConnection: async () => {
+          throw new Error("NJS-503: connection to host 127.0.0.1 port 1521 could not be established");
+        },
+        close: closeFn,
+        connectionsOpen: 0,
+        connectionsInUse: 0,
+      });
+
+      let caught: unknown;
+      try {
+        await provider.connect();
+      } catch (error) {
+        caught = error;
+      }
+
+      // The caller acts on the connect failure. A close failure is cleanup noise
+      // and must not become the reason a connect was refused.
+      expect(caught).toBeInstanceOf(ConnectionError);
+      expect((caught as Error).message).toContain("NJS-503");
+      expect((caught as Error).message).not.toContain("NJS-501");
+      // Asserting the close was attempted is what makes this arm fail on the
+      // unfixed code: without it the old path passes by never calling close.
+      expect(closeFn).toHaveBeenCalledTimes(1);
+      expect(provider.isConnected()).toBe(false);
     });
 
     test("disconnect closes pool and marks disconnected", async () => {
@@ -2661,6 +2779,27 @@ describe("object surface", () => {
     ).toEqual([]);
   });
 
+  test("declares columns on exactly the kinds describeObject resolves as relations", () => {
+    const kinds = makeProvider().getCapabilities().objectKinds ?? [];
+    expect(
+      kinds
+        .filter((kind) => kind.hasColumns === true)
+        .map((kind) => kind.id)
+        .sort(),
+    ).toEqual(["materialized_view", "table", "view"]);
+    // The other direction, and `sequence` is the entry that matters. This provider gates
+    // describeObject on the ROLE (`oracle.ts:2000`), so an Oracle sequence answers no
+    // columns at all - the opposite of PostgreSQL's sequence, which answers last_value,
+    // log_cnt and is_called. Same kind id, opposite answer, which is why the fact is
+    // declared per provider and never derived from the role or from the id (#789).
+    expect(
+      kinds
+        .filter((kind) => kind.hasColumns !== true)
+        .map((kind) => kind.id)
+        .sort(),
+    ).toEqual(["function", "package", "procedure", "sequence", "synonym", "trigger"]);
+  });
+
   test("the container is the connecting user, and other owners are reachable", async () => {
     const statements: string[] = [];
     mockExecuteFn = async (sql: string) => {
@@ -2989,7 +3128,7 @@ describe("object surface", () => {
 /**
  * The rest of the object surface: the dictionary reads behind each kind, the detail row,
  * and the refusals. Kept out of the block above so `-t "object surface"` still runs
- * exactly the five conformance tests.
+ * exactly the six conformance tests.
  */
 describe("Oracle object listing and detail", () => {
   beforeEach(() => {
@@ -3492,6 +3631,43 @@ describe("Oracle object listing and detail", () => {
         { name: "ID", type: "NUMBER", nullable: true, isPrimary: false, defaultValue: undefined },
       ]);
     }
+    await provider.disconnect();
+  });
+
+  test("hasColumns is declared on exactly the kinds whose describeObject answers a column", async () => {
+    // The declaration is a CLIENT GATE: the tree draws a twisty on a kind that declares it
+    // and draws none on a kind that does not, so a declaration that disagrees with this
+    // provider's own answer either opens on nothing or hides columns that exist, and the
+    // second says nothing on screen. Checked against the answer rather than transcribed.
+    mockExecuteFn = async (sql: string) => {
+      if (!sql.includes("ALL_TAB_COLUMNS")) return { rows: [] };
+      return { rows: [{ COLUMN_NAME: "ID", DATA_TYPE: "NUMBER", NULLABLE: "Y", DATA_DEFAULT: null }] };
+    };
+    const provider = makeProvider({ user: "app" });
+    await provider.connect();
+
+    const kinds = provider.getCapabilities().objectKinds ?? [];
+    const answered: string[] = [];
+    for (const kind of kinds) {
+      const detail = await provider.describeObject(["APP", "APP_ORDERS"], kind.id);
+      for (const column of detail.columns) {
+        // Both fields, because the tree feeds the name to `pathKey`, which calls
+        // `replaceAll` on it, and renders the type as the row's trailing text.
+        expect(typeof column.name === "string" && column.name.trim() !== "").toBe(true);
+        expect(typeof column.type === "string" && column.type.trim() !== "").toBe(true);
+      }
+      if (detail.columns.length > 0) answered.push(kind.id);
+    }
+    expect(answered.sort()).toEqual(["materialized_view", "table", "view"]);
+    expect(
+      kinds
+        .filter(kindHasColumns)
+        .map((kind) => kind.id)
+        .sort(),
+    ).toEqual(answered.sort());
+    // The abstainer spelled out at its own object: a sequence is listed, is describable and
+    // carries nothing to expand.
+    expect((await provider.describeObject(["APP", "APP_INVOICE_SEQ"], "sequence")).columns).toEqual([]);
     await provider.disconnect();
   });
 

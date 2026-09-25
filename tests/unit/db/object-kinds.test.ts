@@ -1,6 +1,6 @@
 import { describe, test, expect } from "bun:test";
 import { QueryError } from "@/lib/db/errors";
-import type { ObjectSourcePart, ProviderCapabilities } from "@/lib/db/types";
+import type { ObjectKindSpec, ObjectSourcePart, ProviderCapabilities } from "@/lib/db/types";
 import {
   containerDepth,
   declaredKinds,
@@ -9,6 +9,7 @@ import {
   relationKindIds,
   isCountSampled,
   isCountUnavailable,
+  kindHasColumns,
   kindHasSource,
   isSourcePartUnavailable,
   applySourceBound,
@@ -169,6 +170,37 @@ describe("kindHasSource", () => {
   });
 });
 
+describe("kindHasColumns", () => {
+  const spec = (extra: Partial<ObjectKindSpec>): ObjectKindSpec => ({
+    id: "table",
+    role: "relation",
+    label: "Table",
+    labelPlural: "Tables",
+    ...extra,
+  });
+
+  test("a declared flag reads as true", () => {
+    expect(kindHasColumns(spec({ hasColumns: true }))).toBe(true);
+  });
+
+  test("a spec that declares nothing reads as false, so its object row is a leaf", () => {
+    // The permissive default is wrong here for the reason `acceptsRowWrites` records: only the
+    // provider knows, and a twisty on a kind whose `describeObject` answers `columns: []` opens
+    // on nothing. `role: "relation"` is set on this spec deliberately, because the role is
+    // exactly what this function must NOT read: five `config` kinds in the fleet have columns
+    // and Oracle's `sequence` has none.
+    expect(kindHasColumns(spec({}))).toBe(false);
+    expect(kindHasColumns(spec({ hasColumns: false }))).toBe(false);
+  });
+
+  test("an undefined spec reads as false rather than throwing", () => {
+    // A caller holding only an id passes `findKind(capabilities, id)` straight in, which answers
+    // `undefined` for a kind this provider does not declare, so the absent case is a value this
+    // function is handed rather than one every caller is asked to guard against.
+    expect(kindHasColumns(undefined)).toBe(false);
+  });
+});
+
 describe("isSourcePartUnavailable", () => {
   const refused: ObjectSourcePart = { id: "definition", label: "Definition", unavailable: "Encrypted." };
   const readable: ObjectSourcePart = {
@@ -232,7 +264,7 @@ describe("applySourceBound", () => {
     or a Lua library holding an emoji or an astral CJK character, bounded at exactly the
     offset between the pair, would otherwise end in an unpaired high surrogate: JSON
     serializes it as a lone \ud83d and Monaco renders a replacement glyph. Redis cannot
-    reach this through its own fixture, and every one of the remaining sixteen providers
+    reach this through its own fixture, and every other provider that reads a source
     routes its text through this one function, which is why the guard lives here.
   */
   test("a bound landing inside a surrogate pair cuts before it, never emitting a lone surrogate", () => {

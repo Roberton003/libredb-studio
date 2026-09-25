@@ -59,14 +59,14 @@ Three properties frame everything below, and each of them is load-bearing rather
   on which of its two readings it takes**: `agent-read-only` on the dialects `CATALOG_PLANS` serves,
   because it composes catalog statements, and `agent-operations` everywhere else, because asking a
   provider to describe its own schema sends nothing an engine has to plan. That is what lets grounding
-  reach the thirteen the read-only profile refuses, and it still cannot narrow any workflow's
+  reach the fourteen the read-only profile refuses, and it still cannot narrow any workflow's
   reach: the profile whose acquisition would be refused is never the profile that capture asks for. Everything else about
   the three acquisitions is identical: the same `readOnly: true` open, the same optional
   least-privilege `agentUser`, and the same profiled cache, so neither an operations run nor an
   editor replay is ever handed the editor's writable pool. **Plan mode grounds itself the same way**
   — the server reads the schema, and on PostgreSQL and SQLite the engine's estimated statistics
   beside it, before the model's first turn — so a plan run is now ordinarily grounded on every engine,
-  including the thirteen where an agent run cannot read anything at all. What is left of the old engine
+  including the fourteen where an agent run cannot read anything at all. What is left of the old engine
   rule is narrower and still worth stating: the engine no longer decides WHETHER a plan run is
   grounded, only whether it is grounded through a composed statement or through its provider, and
   whether it gets statistics. A run whose reading fails — a provider that cannot describe itself, a
@@ -567,7 +567,7 @@ What a grounded plan run is given, and where each part comes from:
   including the two free ones. That is deliberate: what the model may conclude must not depend on
   which process happened to have read a catalog first. They are read from what the engine already
   holds — `pg_class.reltuples` and `pg_stats` on PostgreSQL, `sqlite_stat1` on SQLite — so no column
-  is scanned and no value is read out of any row. `ESTIMATE_BUILDERS` serves those two dialects and
+  is scanned and no value is read out of any row. `ESTIMATE_BUILDERS` serves those two and SQL Server (`buildMssqlEstimates`, from `sys.partitions`) and
   nothing else, and #414 added no engine to it: on the other fifteen `readSchemaStatistics` answers
   `DIALECT_HAS_NO_STATISTICS` — *"this engine does not hold statistics this run knows how to read"* —
   so **a known schema with no statistics is now the ORDINARY combination rather than a rare one**, and
@@ -689,9 +689,10 @@ Three consequences worth stating plainly, because each is easy to assume the oth
 
 1. **A plan run costs statements now.** On PostgreSQL and SQLite grounding is catalog reads plus one
    statistics read (two on SQLite: the `sqlite_stat1` availability probe has to be its own statement,
-   because SQLite resolves table names at prepare time). On the other fifteen it is **one** — the
-   single `db.schema.read` call, with no statistics read to add, since those dialects hold none this
-   run knows how to read. Since #789 an engine that declares object kinds costs **one more**, the
+   because SQLite resolves table names at prepare time). On the other sixteen it is **one**, the
+   single `db.schema.read` call, except on SQL Server, which adds the one statistics read
+   `ESTIMATE_BUILDERS` serves outside `CATALOG_PLANS`; the other fifteen hold no statistics this run
+   knows how to read. Since #789 an engine that declares object kinds costs **one more**, the
    object-surface reading above; an engine that declares none is charged nothing extra, because a read
    that cannot exist is never admitted. They come out of the same per-run statement budget every other read does,
    and they are audited the same way. The ledger-reuse path saves the schema reading and deliberately
@@ -745,11 +746,10 @@ engine.
 
 The deliverable is one runnable statement, not a lecture. The rules ask for it in a single fenced
 block tagged with the connection's canonical type-id, rationale after the block, and no name that is
-not in the inventory. Since #414 the WORDING varies with the engine's `queryLanguage` and the TAG does
-not: on a `json` engine the run is asked for one statement or command in that engine's own language —
-a MongoDB aggregation rather than a SELECT — and told that this engine speaks no SQL, while the tag
-stays the canonical type-id in both arms. That is deliberate rather than an oversight: `isQueryFenceTag`
-is a total record over `DatabaseType`, so all seventeen ids pass it, whereas a draft the model fenced as
+not in the inventory.
+Since #414 the WORDING varies with the engine's `queryLanguage` and the TAG does not: on an engine whose language is not SQL (a `json` engine, and since #1085 a `promql` one) the run is asked for one statement or command in that engine's own language, a MongoDB aggregation or a PromQL expression rather than a SELECT, and told that this engine speaks no SQL, while the tag stays the canonical type-id in both arms.
+That is deliberate rather than an oversight: `isQueryFenceTag`
+is a total record over `DatabaseType`, so all eighteen ids pass it, whereas a draft the model fenced as
 ```` ```javascript ```` passes nothing and records no `plan-statement-drafted` event at all — the run
 would score as having drafted nothing while the user is looking at a statement. A run that cannot answer from the
 inventory takes the other legitimate ending: a line beginning `NO STATEMENT:` saying exactly what is
@@ -944,7 +944,7 @@ Two consequences worth stating:
   composed path has and the provider path cannot: reads audited statement by statement rather than as
   one opaque call; foreign keys, which no provider can report on an engine that declares none; and
   SQLite's inventory, which is parsed out of the DDL text the engine stored and which its provider
-  does not expose in the same shape. Collapsing the other fifteen onto the composed one is the thing
+  does not expose in the same shape. Collapsing the other sixteen onto the composed one is the thing
   #414 exists because nobody can do: a catalog statement has to be written per dialect and verified
   against a live server, and until it is, refusing the dialect was the honest answer and reading the
   provider is a better one.
@@ -1827,7 +1827,7 @@ not cover, are all under [`docs/llms/`](llms/README.md).
 
 
 Nothing prevents another model from being configured — the capability probe below decides what any
-given endpoint can do, and there is no allow-list in the code. What the thirty have is a measurement.
+given endpoint can do, and there is no allow-list in the code. What the thirty-five have is a measurement.
 
 ## The model side
 
@@ -2160,9 +2160,10 @@ that follows. What green rules out is a fault that was already on disk when the 
 | `POST /api/agent/runs` | Opens a run (mode, optional `workflowType`, objective, `connectionId`, and optional `previousRunId` to continue the conversation a run this session opened belongs to) and returns `202` with the run id, the PERSISTED mode and workflow type, and the `thread` the run actually belongs to. An unrecognised `workflowType` is refused rather than defaulted. An inline connection in the body is refused. A `previousRunId` that is not a non-empty string is refused `400`; one that cannot be reached does **not** refuse the start — the run opens with no conversation and `thread.declined` says so. An agent run whose workflow sends a statement is refused `400`, before any run is opened, when the connection's engine implements no read-only statement path - `operations` is admitted on every engine, and a planning run is never refused this way. An agent run whose model was established as unable to call tools is refused `422` before any run is opened. |
 | `GET /api/agent/runs/{runId}` | The run record, folded from its ledger. |
 | `DELETE /api/agent/runs/{runId}` | Requests a stop. Cancellation is enforced by the run loop's own persisted state, not by a driver cancel propagating — so this is "asked to stop", not "has stopped". |
+| `PATCH /api/agent/runs/{runId}` | Pauses or resumes the run, by `{"action": "pause"}` or `{"action": "resume"}`. Pause lands only on a running run; resume only on a paused one, and a resume that answers `running` also drives the run again in this process. A refusal is a `409` — the ledger moved between the render and the click, or the action cannot be honoured. |
 | `GET /api/agent/runs/{runId}/stream` | The ledger as NDJSON, one entry per line. |
 | `GET /api/agent/runs/{runId}/artifacts/{correlationId}` | One stored result of that run, for hydration. |
-| `POST /api/agent/drive` | The machine-facing resume seam. |
+| `POST /api/agent/drive` | The machine-facing resume seam. Its response is the drive's outcome: a terminal status with a `stopReason`, or `{"status":"paused","stopReason":null}` when the drive found the run paused and claimed nothing. |
 
 **`src/proxy.ts`'s public-path list is unchanged, and a test asserts that.** The drive route is the
 only route reachable without a user session, and it is not exempt from the middleware: it carries a
@@ -2341,8 +2342,8 @@ figure it qualifies and still in the accessibility tree whether or not that popo
 Two further rules govern it:
 
 - **A control the service cannot honour is not rendered at all.** There is no disabled-looking button
-  standing in for a capability, which is why the rail stops a run but does not offer pause/resume
-  (B11).
+  standing in for a capability: pause is offered on a running run and resume on a paused one, and
+  neither is rendered where the service would refuse it.
 - **The meter reports only what is actually enforced** — statements, database time, the run deadline,
   repair attempts — and states the SQLite non-preemption caveat rather than implying that an
   overrunning statement is cut short. It reports no token budget because none is enforced. A statement that
@@ -2561,7 +2562,7 @@ src/lib/agent/
 ├── runtime.ts            # composition root: the only place that assembles a tool context
 ├── tools.ts              # the four tools + server-side selection; the only database reach,
                           #   the model's tools and the server's own grounding reads alike
-├── composed-sql.ts       # the SQL the SERVER writes, per dialect — four of the seventeen
+├── composed-sql.ts       # the SQL the SERVER writes, per dialect — four of the eighteen
 ├── sqlite-ddl.ts         # reading SQLite's stored DDL back into an inventory
 ├── execution-policy.ts   # the frozen policy and the run-level ceilings
 ├── deadline.ts           # the wall-clock deadline and the timeout clamp
@@ -2611,8 +2612,8 @@ the role's own grants are the whole boundary (A3).
   cancel.
 - **B5** — the ledger assumes one writer per run and cannot enforce it.
 - **B6** — the repair ledger is rebuilt per drive, so a resumed run's repair attempts start over.
-- **B9** — nothing enqueues a drive, so an interrupted run is resumable but never resumed.
-- **B11** — the rail can stop a run but cannot pause or resume one.
+- **B9** — the resume sweep is local-only, so an interrupted run is picked up only on the `local`
+  backend, and only once its claim has gone stale.
 - **B16** — the opt-in `@workflow/world-postgres` backend is not present in the standalone payload,
   so it cannot load in the container image or the npx payload.
 - **B29** — an identifier the model quotes back into its own tool arguments reaches the transcript
@@ -2676,6 +2677,18 @@ the role's own grants are the whole boundary (A3).
   entry was filed about, reached through a proxy rather than through a malformed seed file. Not
   fixed here because separating "unasked" from "measured empty" changes a type every consumer
   reads, and two tests currently pin the wrong half as intended.
+- **B83** — a paused run holds its budget, artifacts and ledger stream until it is unpaused or
+  cancelled, because `releaseExecutionRun` and `close` run only inside `finalize`. Cancelling a
+  paused run releases them; a run left paused does not.
+- **B84**: on a Prometheus server with more metric names than the provider's metric cap, or more series in the hour than its whole-folder describe cap, a plan run's inventory holds metrics and nothing else, because `walkObjectInventory` stops at the first truncated `describeObjects` batch and metrics are the first kind that provider declares.
+  The inventory's `truncated` tells the run that the reading is incomplete, and what it cannot reach is the rule groups, rules, scrape pools and targets a question about alerts or scrape health needs.
+- **B85**: the least-privilege `agentUser` this document names for every acquisition never reaches a run, because a run opens only on a seed and the seed schema carries neither `agentUser` nor `agentPassword`, so a seed file that sets them loses both without an error.
+  Until that changes, an agent runs as a least-privileged role only where the seed's own `user` is that role.
+- **B86**: a block tagged `cql` is read as a plan run's statement on every engine, because `cql` names no engine in `src/lib/sql/fence-tags.ts`, so on a PostgreSQL run a CQL block written before the SQL is recorded as the run's statement and a CQL-only closing is read as one.
+  `promql` had the same flaw and names `prometheus` since #1085.
+- **B87**: a run's inventory count names every kind with the engine's entity noun, because `captureContextSnapshot` counts every object the inventory read and both the answer card and the prompt's inventory header name that count through `inventoryNoun`, so a SQLite run over six tables and two views reads "8 tables read" and a Prometheus run over metrics, rule groups, rules, scrape pools and targets counts them all as metrics.
+  Each inventory row still carries its own kind; the count is what names the wrong thing.
+- **B88**: a kind whose listing the engine refuses ends the grounding walk, because `walkObjectInventory` lists a kind whose count was refused and the capture is all-or-nothing, so a plan run on a seeded VictoriaMetrics connection starts with no inventory and is told the server could not be reached, though it answered three of its four listings.
 
 **Settled as limits rather than as work.** The eight below have no entry in `docs/BACKLOG.md`, and
 that is the point: each is how the product behaves, stated where a reader of this document will meet

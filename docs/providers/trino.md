@@ -528,6 +528,36 @@ listening.
 authentication disabled ([§3.6](#36-a-password-is-a-tls-only-credential)). A password on a plain-HTTP
 connection is refused by the transport constructor rather than sent and 401'd.
 
+
+### 4.4 Endpoint validation and redirects
+
+`host` and `port` are validated when the transport is constructed, which happens in `connect()`, so
+a bad value fails Test Connection and never a capability read. A host must be a hostname, an IPv4
+address or an IPv6 address (bracketed or not), and a port must be an integer from 1 to 65535.
+Anything else is a `DatabaseConfigError` that names the field and does not repeat the value.
+Every request URL is built by the shared [`endpoint.ts`](../../src/lib/db/http/endpoint.ts) with
+`URL` and `URLSearchParams` and checked against the intended hostname, port and path before it is
+sent, so no value can move a request to another path or another server. A scheme's default port
+(80 for `http`, 443 for `https`) is left out of the URL the way `URL` serializes it.
+
+Redirects are not followed. Every request sets `redirect: "manual"`, and a 3xx answer becomes a
+`ConnectionError` naming the status and only the origin of its `Location`, since a followed
+redirect would take the Basic credential and the statement to wherever the server pointed.
+
+Two things differ from the other HTTP transports. The constructor runs inside `connect()`'s guard
+(it also refuses a password over plain HTTP, [§3.6](#36-a-password-is-a-tls-only-credential)), so a
+refused host or port arrives wrapped in the connect failure, `Failed to connect to Trino: Invalid
+host: ...`. And the transport follows links the coordinator hands back, so those links are held to
+the connection's own origin (#1087). Before a `nextUri` is requested, its scheme, host and port are
+compared with the configured ones as parsed origins, so `[::1]` against `[0:0:0:0:0:0:0:1]` and a
+default port left out of the URL compare equal. A link on another origin is refused with a
+`ConnectionError` naming only the two origins, never the path (which carries the query id and a
+continuation slug), and the statement is cancelled on the configured coordinator the way every
+other abandoned loop is. Measured against Trino 476, the coordinator builds `nextUri` from the
+request's own `Host` header, so a direct connection always gets links on the origin it used; a
+reverse proxy that rewrites `Host` would make the coordinator advertise its own address, and that
+is what the refusal message points at.
+
 ---
 
 ## 5. Query interface
@@ -685,6 +715,13 @@ is among them, and there is no index catalog at all
 ([§3.8](#38-no-keys-no-indexes--and-why-that-is-a-fact-about-the-engine)). A declared kind draws a
 folder, and a folder for something the engine cannot have is a lie its zero badge makes look like a
 fact.
+
+`hasColumns: true` is declared on the three relation kinds, `table`, `view` and
+`materialized_view`, and on nothing else: `describeObject` gates on the role, so `function` answers
+`columns: []` without reaching the cluster, and the object tree therefore draws no expander on a
+function row. One `describeObject` here is the most expensive single object read in the fleet at
+25.8 ms, measured in the A/B below against `describeObjects()`, which the tree pays once for each
+row a reader expands and never for a row they do not.
 
 `describeObject` therefore answers `indexes: []` and `foreignKeys: []` for every kind, and every
 column carries `isPrimary: false`. Those are the engine's answers and not defaults this provider

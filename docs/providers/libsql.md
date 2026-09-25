@@ -371,6 +371,25 @@ turso db tokens create <database> --read-only  # read-only, the engine-side answ
 A self-hosted `sqld` started without authentication takes no token at all, and sending an empty one
 is a 400 rather than an anonymous connection — so a connection with no token sends no header.
 
+
+### 4.4 Endpoint validation and redirects
+
+`host` and `port` are validated when the transport is constructed, which happens in `connect()`, so
+a bad value fails Test Connection and never a capability read. A host must be a hostname, an IPv4
+address or an IPv6 address (bracketed or not), and a port must be an integer from 1 to 65535.
+Anything else is a `DatabaseConfigError` that names the field and does not repeat the value.
+Every request URL is built by the shared [`endpoint.ts`](../../src/lib/db/http/endpoint.ts) with
+`URL` and `URLSearchParams` and checked against the intended hostname, port and path before it is
+sent, so no value can move a request to another path or another server. A scheme's default port
+(80 for `http`, 443 for `https`) is left out of the URL the way `URL` serializes it.
+
+Redirects are not followed. Every request sets `redirect: "manual"`, and a 3xx answer becomes a
+`ConnectionError` naming the status and only the origin of its `Location`, since a followed
+redirect would take the token and the statement to wherever the server pointed.
+
+`serverVersion()` answers `null` for every failure by contract ([§3.10](#310-the-version-panel-names-what-the-deployment-publishes)),
+so a redirect from `/version` is one more "no version to show". It is still not followed.
+
 ---
 
 ## 5. Query interface
@@ -541,6 +560,12 @@ holding only the second shape makes this predicate look untestable when it is no
 
 An `index` and a `trigger` answer three empty arrays without touching the network, which is a true fact
 about those kinds rather than a failed read.
+
+`table` and `view` are therefore the only kinds here that declare `hasColumns`, so they are the only rows
+the object tree gives a twisty and expands into column rows; `index` and `trigger` declare nothing and stay
+leaves, which is what `describeObject()` answering no column for them means (#789).
+Both deployments this one type-id serves, self-hosted sqld and Turso Cloud, read the same pragmas through
+the same transport, so the declaration is one fact about the engine and not per deployment.
 
 For a `table` and a `view` the reads are batched, and that is where this provider stops being
 [sqlite.ts](../../src/lib/db/providers/sql/sqlite.ts): there every read is a call into a file handle, and

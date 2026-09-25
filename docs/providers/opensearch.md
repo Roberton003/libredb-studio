@@ -493,6 +493,22 @@ disabled by name.
 An IPv6 literal host is bracketed before it becomes a URL authority
 ([http-transport.ts:431](../../src/lib/db/providers/sql/search/http-transport.ts)).
 
+
+### 4.4 Endpoint validation and redirects
+
+`host` and `port` are validated when the transport is constructed, which happens in `connect()`, so
+a bad value fails Test Connection and never a capability read. A host must be a hostname, an IPv4
+address or an IPv6 address (bracketed or not), and a port must be an integer from 1 to 65535.
+Anything else is a `DatabaseConfigError` that names the field and does not repeat the value.
+Every request URL is built by the shared [`endpoint.ts`](../../src/lib/db/http/endpoint.ts) with
+`URL` and `URLSearchParams` and checked against the intended hostname, port and path before it is
+sent, so no value can move a request to another path or another server. A scheme's default port
+(80 for `http`, 443 for `https`) is left out of the URL the way `URL` serializes it.
+
+Redirects are not followed. Every request sets `redirect: "manual"`, and a 3xx answer becomes a
+`ConnectionError` naming the status and only the origin of its `Location`, since a followed
+redirect would take the Basic credential and the statement to wherever the server pointed.
+
 ---
 
 ## 5. Query interface
@@ -948,6 +964,13 @@ the concrete index name - and **no columns** for a `pipeline` or a `template`, w
 answer rather than a gap: they are JSON documents with no field list, exactly as a routine, a trigger
 and a sequence have no columns on the SQL engines. `indexes` and `foreignKeys` are always empty, for
 the reasons in the table above.
+
+Those same three kinds declare `hasColumns: true` (#789), which is what gives an object row a twisty
+in the object tree; a `pipeline` and a `template` declare nothing and stay leaves, so no column read
+is ever issued for them. An `alias` row and a `data stream` row show the mapping of **one** backing
+index: the transport takes the first entry of a `_mapping` payload keyed by concrete index name
+(`src/lib/db/providers/sql/search/http-transport.ts:1266`), so an alias spanning two indices shows
+whichever the cluster answered first, with nothing on screen to say the other is missing.
 
 #### `describeObjects`, the bulk column read (#789)
 

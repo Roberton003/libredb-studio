@@ -1427,24 +1427,39 @@ export class OracleProvider extends SQLBaseProvider {
       // TABLE_NAME and an index cannot exist without them - so it belongs in
       // `describeObject`'s output, where it is, rather than in a folder of its own.
       objectKinds: [
+        // `hasColumns` on the three kinds and no more, and it is written out rather than
+        // derived from `role === "relation"` even though the two agree here (#789).
+        // `describeObject` gates on the role at `oracle.ts:2015`, so a sequence answers no
+        // columns at all - the opposite of PostgreSQL's sequence, which answers last_value,
+        // log_cnt and is_called. Same kind id, opposite answer, so the fact is the
+        // provider's to state and the tree draws a twisty on nothing else.
         {
           id: "table",
           role: "relation",
           label: "Table",
           labelPlural: "Tables",
           acceptsRowWrites: true,
+          hasColumns: true,
           ...ORACLE_SOURCE_DECLARATION,
         },
         // No `acceptsRowWrites` on either view kind. Oracle takes an UPDATE against a
         // key-preserved view and refuses it against the rest, which is a per-OBJECT fact
         // this per-kind declaration cannot state; a materialized view takes no row write
         // at all, since its rows come from its query.
-        { id: "view", role: "relation", label: "View", labelPlural: "Views", ...ORACLE_SOURCE_DECLARATION },
+        {
+          id: "view",
+          role: "relation",
+          label: "View",
+          labelPlural: "Views",
+          hasColumns: true,
+          ...ORACLE_SOURCE_DECLARATION,
+        },
         {
           id: "materialized_view",
           role: "relation",
           label: "Materialized View",
           labelPlural: "Materialized Views",
+          hasColumns: true,
           ...ORACLE_SOURCE_DECLARATION,
         },
         { id: "synonym", role: "config", label: "Synonym", labelPlural: "Synonyms", ...ORACLE_SOURCE_DECLARATION },
@@ -1597,6 +1612,21 @@ export class OracleProvider extends SQLBaseProvider {
       this.setConnected(true);
     } catch (error) {
       this.setError(error instanceof Error ? error : new Error(String(error)));
+      // A failed connect orphans its pool, and oracledb's background creator keeps
+      // reaching for `poolMin` connections with no delay between attempts (#1102):
+      // measured at ~14,000 TCP connects and one full CPU core per second, forever.
+      // `factory.getOrCreateProvider()` never caches a provider whose `connect()`
+      // threw, so no later `disconnect()` can reach it - the provider has to clean
+      // up after itself, the contract PostgreSQL and SQL Server already follow.
+      // `close(0)` is oracledb's equivalent of `end()`: force close, do not wait.
+      // The clearing matters as much as the close. Left set, `this.pool` makes the
+      // guard at the top of connect() return on a retry without dialling and
+      // without an error, so the caller reads a silent success.
+      const failedPool = this.pool;
+      this.pool = null;
+      // A close failure is cleanup noise. Awaiting it with `.catch(() => {})` keeps
+      // it from becoming the reason a connect was refused.
+      await failedPool?.close(0).catch(() => {});
       // NJS-138 (server predates Oracle 12.1, incompatible with Thin mode) is a permanent
       // configuration problem, not a transient connection failure — map it through
       // mapDatabaseError() so it surfaces as a non-retryable DatabaseConfigError instead of

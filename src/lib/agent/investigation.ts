@@ -134,6 +134,7 @@ import {
   type AgentRunEvent,
   type AgentRunMode,
   type AgentRunRecord,
+  type AgentRunStatus,
   type AgentRunStopReason,
   type AgentRunTerminalStatus,
   type AgentRunWorkflowType,
@@ -166,15 +167,30 @@ export interface AgentInvestigationOptions {
  */
 export type AgentInvestigationStopReason = AgentRunStopReason;
 
-export interface AgentInvestigationResult {
+/** The fields every drive outcome carries, terminal or paused. */
+export interface AgentInvestigationResultBase {
   readonly runId: string;
-  readonly status: AgentRunTerminalStatus;
-  readonly stopReason: AgentInvestigationStopReason;
   /** Model turns this drive took. A resumed run counts its own, not the dead one's. */
   readonly turns: number;
   /** The model's last prose. A planning run's whole output; an agent run's aside. */
   readonly text: string;
 }
+
+/**
+ * What one drive ended with. The union keeps `status` and `stopReason` tied
+ * together: a terminal status always carries a stop reason, and `paused` never
+ * does, so a reader who narrows on the status knows from the type alone.
+ */
+export type AgentInvestigationResult =
+  | (AgentInvestigationResultBase & {
+      readonly status: AgentRunTerminalStatus;
+      readonly stopReason: AgentInvestigationStopReason;
+    })
+  | (AgentInvestigationResultBase & {
+      /** The drive stopped at the pause checkpoint; the run is left paused, not ended. */
+      readonly status: "paused";
+      readonly stopReason: null;
+    });
 
 /**
  * The tools that reach the database. The ledger-only ones are handled apart.
@@ -249,8 +265,9 @@ const AGENT_RULES = [
 ].join(" ");
 
 /**
- * What the run is told when it has come within the reserve of a ceiling (§1.5 of
- * `docs/AGENT_ANALYST_DESIGN.md`).
+ * What the run is told when it has come within the reserve of a ceiling (see "A run
+ * keeps its last turns back for its report" in the "What bounds a run" section of
+ * `docs/AGENT.md`).
  *
  * "Finish by calling compose_report" is already in `AGENT_RULES`; what nothing said
  * until now is WHEN the room ran out. That is the #350 lesson applied ahead of time:
@@ -1021,14 +1038,14 @@ const PLAN_DELIVERABLES: Readonly<Record<AgentRunWorkflowType, PlanDeliverable>>
  * `language` arrived with #414 and every sentence that assumed SQL is now written
  * twice. The tag does NOT vary with it and that is the point of taking the language
  * separately: the tag is the canonical type-id in both arms, because it is what
- * `isQueryFenceTag` accepts (a total record over `DatabaseType`, so all seventeen pass)
+ * `isQueryFenceTag` accepts (a total record over `DatabaseType`, so every type-id passes)
  * and what `rich-text.tsx` and `readPlanStatement` key the editor hand-off on. A draft
  * a model fenced as ```` ```javascript ```` produces no `plan-statement-drafted` event
  * at all — the run would be scored as having drafted nothing while the user is looking
  * at a statement — so the one thing this contract cannot afford to leave to the model
  * is what the tag says.
  *
- * What the json arm has to say instead is that SQL is the wrong language, and it has
+ * What the arm for every other language has to say instead is that SQL is the wrong language, and it has
  * to say it: the objective is prose, the words "statement", "table" and "column" are
  * all over the conversation, and a model handed a MongoDB inventory under those words
  * will write SQL against it unless told not to. The second clause is about the same
@@ -2478,11 +2495,12 @@ function promptedResultMessage(call: { toolName: string }, value: string): Model
   return { role: "user", content: `The server ran ${call.toolName} and answers: ${value}` };
 }
 
-/** What handling one tool call did. `cancelled` and `reported` both end the run. */
+/** What handling one tool call did. `cancelled` and `reported` both end the run; `paused` leaves it paused. */
 type CallResult =
   | { readonly kind: "answered"; readonly text: string }
   | { readonly kind: "cancelled" }
-  | { readonly kind: "reported" };
+  | { readonly kind: "reported" }
+  | { readonly kind: "paused" };
 
 /**
  * Drives one investigation run to a conclusion, starting it or resuming it.
@@ -2556,6 +2574,13 @@ export async function runInvestigation(
   // Refuses a run that has ended, and tells us what the previous process left
   // behind. A queued run is one nothing has driven yet; a running one is a resume.
   const resumed = await service.resume(runId);
+
+  // A run already paused before its drive is not driven: it has no turn to take,
+  // and every ledger write below is gated on RUNNING. Stopping here leaves it
+  // paused, exactly as the rail asked, instead of throwing at `recordDriver`.
+  if (resumed.record.status === "paused") {
+    return { runId, status: "paused", stopReason: null, turns: 0, text: "" };
+  }
 
   // One drive per run in this process: two would both pass `runStep`'s
   // read-then-append check and execute the same step twice (`docs/BACKLOG.md` B5).
@@ -3358,6 +3383,13 @@ export async function runInvestigation(
       status: AgentRunTerminalStatus,
       stopReason: AgentRunStopReason,
     ): Promise<AgentInvestigationResult> => {
+      // A pause that landed while the model was composing its closing work wins: the
+      // drive stops and leaves the run paused, and whatever the model already wrote
+      // stays on the ledger instead of being finished over.
+      const live = await service.status(runId);
+      if (live?.record.status === "paused") {
+        return { runId, status: "paused", stopReason: null, turns, text };
+      }
       if (text.length > 0) {
         await service.recordEvent(runId, { kind: "closing-statement", text });
         // After the prose, in the order a reader folds them: the statement is a fact
@@ -3935,6 +3967,11 @@ export async function runInvestigation(
           // refuse, and rightly.
           return { runId, status: "cancelled", stopReason: "cancelled", turns, text };
         }
+        if (outcome.kind === "paused") {
+          // `runStep` left the run paused at its checkpoint; the drive stops without
+          // finishing it, and a paused run has no stop reason to record.
+          return { runId, status: "paused", stopReason: null, turns, text };
+        }
         if (outcome.kind === "reported") return conclude("succeeded", "report-composed");
         messages.push(prompted ? promptedResultMessage(call, outcome.text) : toolResultMessage(call, outcome.text));
       }
@@ -3953,8 +3990,15 @@ export async function runInvestigation(
     let result: AgentInvestigationResult | null = null;
     while (result === null) {
       const remainingMs = resources.deadline.remainingMs();
-      if ((await service.status(runId))?.cancellationRequested === true) {
+      const status = await service.status(runId);
+      if (status?.cancellationRequested === true) {
         result = await conclude("cancelled", "cancelled");
+      } else if (status?.record.status === "paused") {
+        // A pause that arrived while the model was thinking, between tool calls: stop
+        // driving and leave the run paused. Read here for the same reason the
+        // cancellation check is — a planning run reaches no tool, so runStep's
+        // checkpoint would never be called.
+        result = { runId, status: "paused", stopReason: null, turns, text };
       } else if (remainingMs <= 0) result = await conclude("failed", "deadline-exceeded");
       else if (turns >= maxTurns) result = await conclude("failed", "turn-limit");
       else result = await driveTurn(remainingMs);
@@ -4010,6 +4054,11 @@ async function handleCall(input: {
   // the ledger has not seen: a resumed run that replays a call must not write a
   // second draft for it.
   if (draft !== null && !known.has(stepId)) {
+    // Not a safety gate anymore — `recordEvent` now accepts a paused run — but still
+    // worth the read: a pause means "take no new step", and narrating a draft the
+    // user will never see run would record a step the drive then refuses to perform.
+    const live = await service.status(record.runId);
+    if (live?.record.status === "paused") return { kind: "paused" };
     await service.recordEvent(record.runId, { kind: "statement-drafted", stepId, ...draft });
   }
   known.add(stepId);
@@ -4035,6 +4084,7 @@ async function handleCall(input: {
   });
 
   if (result.kind === "cancelled") return { kind: "cancelled" };
+  if (result.kind === "paused") return { kind: "paused" };
   if (result.kind === "performed") return { kind: "answered", text: modelText };
   if (result.kind === "replayed") {
     return {
@@ -4128,6 +4178,7 @@ async function profileTable(
   );
 
   if (result.kind === "cancelled") return { kind: "cancelled" };
+  if (result.kind === "paused") return { kind: "paused" };
   if (result.kind === "performed") return { kind: "answered", text: modelText };
   if (result.kind === "replayed") {
     // The profile is already on this run's ledger; re-reading the table would spend

@@ -239,13 +239,22 @@ mock.module("@/hooks/use-all-connections", () => ({
 // ── Imports AFTER mocks ──────────────────────────────────────────────────────
 
 import { describe, test, expect, beforeEach, afterEach, spyOn } from "bun:test";
-import { render, fireEvent, cleanup, act } from "@testing-library/react";
+import { render, fireEvent, cleanup, act, waitFor } from "@testing-library/react";
 import { SchemaDiff } from "@/components/SchemaDiff";
 import { logger } from "@/lib/logger";
 import { mockSchema } from "../fixtures/schemas";
 import { mockMySQLConnection, mockPostgresConnection } from "../fixtures/connections";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+// The clipboard harness, as in tests/components/CodeGenerator.test.tsx: the migration SQL's copy
+// button is the shared `CopyButton`, so the test stands in for `navigator.clipboard` and puts the
+// original back afterwards.
+const originalClipboard = Object.getOwnPropertyDescriptor(globalThis.navigator, "clipboard");
+
+function setClipboard(clipboard: { writeText: (text: string) => Promise<void> } | undefined): void {
+  Object.defineProperty(globalThis.navigator, "clipboard", { value: clipboard, configurable: true });
+}
 
 function renderDiff(overrides: Partial<Parameters<typeof SchemaDiff>[0]> = {}) {
   return render(<SchemaDiff schema={mockSchema} connection={mockPostgresConnection} {...overrides} />);
@@ -370,6 +379,8 @@ describe("SchemaDiff", () => {
 
   afterEach(() => {
     cleanup();
+    if (originalClipboard === undefined) setClipboard(undefined);
+    else Object.defineProperty(globalThis.navigator, "clipboard", originalClipboard);
   });
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -2462,6 +2473,29 @@ describe("SchemaDiff", () => {
       expect(pre!.textContent).toContain("CREATE TABLE");
     });
 
+    // #751: the migration view rendered its SQL in a bare <pre>, so the only way to take it away
+    // was a manual text selection. The shared CopyButton is the one every other generated-SQL
+    // view uses, and it puts exactly `text` on the clipboard.
+    test("offers a copy button that puts exactly the migration SQL on the clipboard", async () => {
+      const writeText = mock(async (t: string) => {
+        void t;
+      });
+      setClipboard({ writeText });
+
+      const { getByText, getByTestId } = renderWithDiff();
+      fireEvent.click(getByText("SQL Migration"));
+      fireEvent.click(getByTestId("schema-diff-migration-copy"));
+
+      expect(writeText).toHaveBeenCalledTimes(1);
+      expect(writeText).toHaveBeenCalledWith("CREATE TABLE new_table (\n  id integer\n);\nDROP TABLE old_table;");
+      await waitFor(() => expect(getByTestId("schema-diff-migration-copy").textContent).toContain("Copied"));
+    });
+
+    test("has no copy button while the diff view is showing", () => {
+      const { queryByTestId } = renderWithDiff();
+      expect(queryByTestId("schema-diff-migration-copy")).toBeNull();
+    });
+
     test("generateMigrationSQL receives correct dialect", () => {
       renderWithDiff();
       if (mockGenerateMigrationSQL.mock.calls.length > 0) {
@@ -2477,6 +2511,61 @@ describe("SchemaDiff", () => {
         const dialect = (mockGenerateMigrationSQL.mock.calls as unknown[][])[0][1];
         expect(dialect).toBe("postgres");
       }
+    });
+
+    test("schema-diff-migration-copy button renders and copies migration SQL", () => {
+      const writeText = mock(async (t: string) => {
+        void t;
+      });
+      const originalClipboard = Object.getOwnPropertyDescriptor(globalThis.navigator, "clipboard");
+      Object.defineProperty(globalThis.navigator, "clipboard", {
+        value: { writeText },
+        configurable: true,
+      });
+
+      try {
+        const { getByText, getByTestId } = renderWithDiff();
+        fireEvent.click(getByText("SQL Migration"));
+
+        const copyBtn = getByTestId("schema-diff-migration-copy");
+        expect(copyBtn).toBeTruthy();
+        expect(copyBtn.textContent).toContain("Copy");
+
+        fireEvent.click(copyBtn);
+        expect(writeText).toHaveBeenCalledTimes(1);
+        expect((writeText.mock.calls as unknown[][])[0][0]).toContain("CREATE TABLE new_table");
+      } finally {
+        if (originalClipboard === undefined) {
+          Object.defineProperty(globalThis.navigator, "clipboard", { value: undefined, configurable: true });
+        } else {
+          Object.defineProperty(globalThis.navigator, "clipboard", originalClipboard);
+        }
+      }
+    });
+
+    test("schema-diff-migration-copy button is pinned over the scrollable pre container rather than inside it", () => {
+      const { getByText, getByTestId, container } = renderWithDiff();
+      fireEvent.click(getByText("SQL Migration"));
+
+      const copyBtn = getByTestId("schema-diff-migration-copy");
+      const pre = container.querySelector("pre");
+      expect(pre).toBeTruthy();
+      expect(copyBtn).toBeTruthy();
+
+      // Structural assertion: The copy button must not sit inside the scrollable pre tag,
+      // where scrolling long migration text would carry the button away (#1080).
+      expect(pre!.contains(copyBtn)).toBe(false);
+
+      // The pre must be constrained with a scrollable max-height, and the button must be
+      // pinned absolutely over the relative wrapper container.
+      expect(pre!.className).toContain("overflow-auto");
+      expect(pre!.className).toContain("max-h-");
+      expect(copyBtn.className).toContain("absolute");
+
+      const parentWrapper = copyBtn.parentElement;
+      expect(parentWrapper).toBeTruthy();
+      expect(parentWrapper!.className).toContain("relative");
+      expect(parentWrapper!.contains(pre!)).toBe(true);
     });
   });
 

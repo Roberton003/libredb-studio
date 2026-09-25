@@ -664,6 +664,22 @@ Two consequences worth stating plainly:
   host/port fields alone cannot express TLS — without it the connection would go out as plaintext
   HTTP to the TLS port and fail with a bare `fetch failed`.
 
+
+### 4.4 Endpoint validation and redirects
+
+`host` and `port` are validated when the transport is constructed, which happens in `connect()`, so
+a bad value fails Test Connection and never a capability read. A host must be a hostname, an IPv4
+address or an IPv6 address (bracketed or not), and a port must be an integer from 1 to 65535.
+Anything else is a `DatabaseConfigError` that names the field and does not repeat the value.
+Every request URL is built by the shared [`endpoint.ts`](../../src/lib/db/http/endpoint.ts) with
+`URL` and `URLSearchParams` and checked against the intended hostname, port and path before it is
+sent, so no value can move a request to another path or another server. A scheme's default port
+(80 for `http`, 443 for `https`) is left out of the URL the way `URL` serializes it.
+
+Redirects are not followed. Every request sets `redirect: "manual"`, and a 3xx answer becomes a
+`ConnectionError` naming the status and only the origin of its `Location`, since a followed
+redirect would take the Basic credential and the statement to wherever the server pointed.
+
 ---
 
 ## 5. Query interface
@@ -929,6 +945,14 @@ in both methods, so one bad call reports the same thing either way.
 
 An empty column answer raises for a dictionary too, for the same reason as for a table: a dictionary
 always declares at least a key, so nothing there under that name is the only way to read it.
+
+`hasColumns` is declared on exactly the four kinds that read a catalog, `table`, `view`,
+`materialized_view` and `dictionary`, so those rows expand to their columns in the object tree, while
+`function` declares nothing and stays a leaf because `describeObject()` answers it `columns: []`
+without a round trip.
+The dictionary is one of the fleet's five refutations of `role === 'relation'` as that gate: it is
+declared `config` and still answers its structure, out of `system.dictionaries`, which is why the
+declaration is per kind and measured rather than derived from the role.
 
 `foreignKeys` is always `[]`, the same fact as in section 6: ClickHouse parses `REFERENCES` and
 enforces nothing by it, and `system.*` holds no constraint catalog to read one back from.

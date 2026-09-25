@@ -211,7 +211,22 @@ mapping, and for the two Oracle-specific consequences: the chain is **always** v
 `rejectUnauthorized` to turn off), and the CA and client certificates travel as one `walletContent`
 PEM rather than three options.
 
-### 3.6 Privilege-resilient monitoring
+### 3.6 A failed connect closes the pool it created
+
+`createPool()` resolves before anything is dialled in Thin mode, so a connect that fails on its test
+borrow already holds a live pool. `factory.getOrCreateProvider()` never caches a provider whose
+`connect()` threw, which means nothing can call `disconnect()` on it afterwards, and node-oracledb's
+background creator keeps reaching for `poolMin` connections with **no delay between attempts**. One
+failed connect to an unreachable host therefore pins a CPU core and floods that host until the
+process exits — measured at roughly 14,000 TCP connect attempts and one full core per second.
+
+The `catch` in `connect()` closes that pool with `close(0)` (force close, the oracledb equivalent of
+`end()`) and clears `this.pool` before rethrowing, so a retried `connect()` creates a fresh pool
+instead of returning silently through the `if (this.pool)` guard while connected to nothing. A
+`close()` that itself rejects is swallowed rather than replacing the connect error. This is the same
+contract PostgreSQL and SQL Server already follow ([#1102](https://github.com/libredb/libredb-studio/issues/1102)).
+
+### 3.7 Privilege-resilient monitoring
 
 Oracle monitoring reads `V$` dynamic-performance views, which require privileges a typical app user
 may lack. Every monitoring sub-query is wrapped in its own try/catch and degrades rather than failing
@@ -1162,6 +1177,17 @@ breaks: these statements key the last path segment against `TABLE_NAME`, and a t
 `APP_ORDERS` on table `APP_CUSTOMERS` is legal, so it would have been handed `APP_ORDERS`'s columns
 as if they were its own.
 
+Those same three kinds, `table`, `view` and `materialized_view`, are the ones that declare
+`hasColumns`, which is what gives an object row a twisty in the object tree; a synonym, a sequence, a
+package, a procedure, a function and a trigger declare nothing and are leaves, because
+`describeObject()` answers them three empty arrays.
+`sequence` is why the declaration is per provider rather than derived from the role or the kind id:
+this provider gates on the role, so an Oracle sequence has no columns at all, while PostgreSQL's
+`sequence` answers `last_value`, `log_cnt` and `is_called` under the same kind id.
+An object dropped between the listing and the expand is not an error here: the four reads answer no
+row and `describeObject()` returns three empty arrays, which the tree reports on the open row as
+`No columns reported` rather than as a refusal.
+
 Two of the four statements differ from the deleted flat reading's counterparts on purpose:
 
 - The foreign-key read pairs columns with `rcc.POSITION = acc.POSITION`. Without it a two-column
@@ -1558,7 +1584,7 @@ No kind here declares `acceptsSourceEdits`, and `tests/isolated/object-edit-decl
 ## 8. Monitoring & health
 
 All from `V$`/`USER_*` views; `getMonitoringData()` (inherited) fans them out in parallel. Each
-sub-query is independently privilege-guarded ([§3.6](#36-privilege-resilient-monitoring)).
+sub-query is independently privilege-guarded ([§3.7](#37-privilege-resilient-monitoring)).
 
 | Method | Primary source | Notes / degradation |
 |--------|----------------|---------------------|

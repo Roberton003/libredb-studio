@@ -273,13 +273,21 @@ const CTE_PK_INFO = `
           GROUP BY tc.table_schema, tc.table_name
         )`;
 
+// Every object row is built with jsonb_agg()/jsonb_build_object() and every empty list is
+// typed jsonb, never json (#1075). RisingWave 3.0.4 has no json type at all and refuses
+// json_agg(), json_build_object(), '[]'::json and CAST(NULL AS json) alike, while it answers
+// every jsonb form; PostgreSQL and every relative measured on the same day answer both, and
+// node-postgres parses the two OIDs into the same plain value. jsonb reorders an object's
+// keys and drops duplicate ones, which changes nothing here: each object has a fixed set of
+// distinct keys and is read parsed, never as text. It keeps an array's order, which is what
+// `ORDER BY a.attnum` relies on to hand back the table's own column order.
 const CTE_FK_INFO = `
         fk_info AS MATERIALIZED (
           SELECT
             tc.table_schema,
             tc.table_name,
-            json_agg(
-              json_build_object(
+            jsonb_agg(
+              jsonb_build_object(
                 'columnName', kcu.column_name,
                 'referencedSchema', ccu.table_schema,
                 'referencedTable', ccu.table_name,
@@ -298,19 +306,19 @@ const CTE_FK_INFO = `
           GROUP BY tc.table_schema, tc.table_name
         )`;
 
+// An index's column list is read in a LATERAL join and not as a subquery inside the
+// aggregate: RisingWave 3.0.4 refuses any subquery among an aggregate call's arguments,
+// "subquery inside aggregation calls", measured 2026-09-24 (#1075). The join is the same
+// per-index read the subquery was, and an index over expressions alone still answers NULL.
 const CTE_INDEX_INFO = `
         index_info AS MATERIALIZED (
           SELECT
             n.nspname as table_schema,
             t.relname as table_name,
-            json_agg(
-              json_build_object(
+            jsonb_agg(
+              jsonb_build_object(
                 'name', i.relname,
-                'columns', (
-                  SELECT array_agg(a.attname ORDER BY array_position(ix.indkey, a.attnum))
-                  FROM pg_attribute a
-                  WHERE a.attrelid = t.oid AND a.attnum = ANY(ix.indkey)
-                ),
+                'columns', ic.columns,
                 'unique', ix.indisunique
               )
             ) as indexes
@@ -318,6 +326,11 @@ const CTE_INDEX_INFO = `
           JOIN pg_class t ON t.oid = ix.indrelid
           JOIN pg_class i ON i.oid = ix.indexrelid
           JOIN pg_namespace n ON n.oid = t.relnamespace
+          LEFT JOIN LATERAL (
+            SELECT array_agg(a.attname ORDER BY array_position(ix.indkey, a.attnum)) AS columns
+            FROM pg_attribute a
+            WHERE a.attrelid = t.oid AND a.attnum = ANY(ix.indkey)
+          ) ic ON true
           WHERE ${schemaExclusion("n.nspname")}
           GROUP BY n.nspname, t.relname
         )`;
@@ -331,21 +344,10 @@ function withoutMaterializedHint(sql: string): string {
   return sql.replace(/\bAS MATERIALIZED\s*\(/gi, "AS (");
 }
 
-// Message text for this collision is not standardized across engines - PostgreSQL-style
-// "syntax error at or near ..." never applies here since real PostgreSQL accepts the hint,
-// so only an engine that rejects it reaches this check. Materialize says "Expected left
-// parenthesis, found MATERIALIZED" - no "syntax error" substring at all. This SQL text is
-// always exactly one of the SCHEMA_*_SQL consts above, so any error naming MATERIALIZED is
-// necessarily about this reserved-keyword collision, not an unrelated coincidence.
-function isMaterializedKeywordSyntaxError(error: unknown): boolean {
-  if (!(error instanceof Error)) return false;
-  return error.message.toLowerCase().includes("materialized");
-}
-
 // CockroachDB has no pg_total_relation_size() builtin (its own compatibility.ts entry
-// says so); Materialize reaches the same gap once the MATERIALIZED retry above gets past
-// the keyword collision. Replacing the call with a literal 0 loses per-table size for
-// those engines but recovers every other column instead of failing the query outright.
+// says so), and neither has Materialize. Replacing the call with a literal 0 loses
+// per-table size for those engines but recovers every other column instead of failing
+// the query outright.
 function withoutTotalRelationSizeFn(sql: string): string {
   return sql.replace(/pg_total_relation_size\(c\.oid\)/gi, "0");
 }
@@ -353,21 +355,6 @@ function withoutTotalRelationSizeFn(sql: string): string {
 function isMissingTotalRelationSizeError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   return error.message.toLowerCase().includes("pg_total_relation_size");
-}
-
-// Materialize has no json_agg()/json_build_object() - only their jsonb_ equivalents,
-// which return the same array/object shape over the wire (node-postgres parses both
-// the json and jsonb OIDs into plain JS values), so swapping the function name is
-// enough; the '[]'::json casts elsewhere in these queries are unaffected, since the
-// json TYPE itself does exist there.
-function withoutJsonAggFunctions(sql: string): string {
-  return sql.replace(/\bjson_agg\(/gi, "jsonb_agg(").replace(/\bjson_build_object\(/gi, "jsonb_build_object(");
-}
-
-function isMissingJsonAggError(error: unknown): boolean {
-  if (!(error instanceof Error)) return false;
-  const message = error.message.toLowerCase();
-  return message.includes("json_agg") || message.includes("json_build_object");
 }
 
 // Replaces one named CTE's body, matching the closing parenthesis by depth rather
@@ -412,7 +399,7 @@ const EMPTY_FK_INFO_BODY = `
           SELECT
             NULL::text AS table_schema,
             NULL::text AS table_name,
-            NULL::json AS foreign_keys
+            NULL::jsonb AS foreign_keys
           WHERE false
         `;
 
@@ -587,6 +574,17 @@ const RELKIND_BY_KIND: Record<string, string> = {
   sequence: "'S'",
 };
 
+/**
+ * Whether a kind id is backed by a `pg_class` relation, which is exactly whether an object of
+ * it can have columns (#789).
+ *
+ * Read by the `objectKinds` declaration and gated on by `describeObject`, so the declaration the
+ * object tree draws a twisty from and the read that fills it are one fact rather than two.
+ */
+function hasColumns(kind: string): boolean {
+  return Object.hasOwn(RELKIND_BY_KIND, kind);
+}
+
 // `reltuples` is read here for the same reason `CTE_TABLES_INFO` reads it, and is mapped
 // through the same `estimatedRowCount()`: PostgreSQL 14+ writes -1 for a relation nothing
 // has analysed, and that is an absence rather than an empty relation.
@@ -599,8 +597,7 @@ const RELKIND_BY_KIND: Record<string, string> = {
 // every relation on CockroachDB and Materialize as 0 bytes. The size column is simply
 // dropped instead (`withSize: false`), so the row carries no `size_bytes` at all and
 // `measuredSizeBytes()` reads absence. Nothing else in this statement is repairable by
-// that chain: it has no `AS MATERIALIZED`, no `json_agg`, no `to_regclass` and no
-// `pg_depend`.
+// that chain: it has no `AS MATERIALIZED`, no `to_regclass` and no `pg_depend`.
 function listRelationsSql(relkinds: string): string {
   return `
         SELECT
@@ -1191,15 +1188,20 @@ function routineEditAffordance(row: SourceRow, schema: string, name: string): Ob
 // the bare word `ARRAY` and hides the element type in `element_types`. The two surfaces
 // disagree on exactly those columns, and the object model has the better half of the
 // disagreement, so this is recorded rather than repaired.
+//
+// `pg_get_expr()` is asked only when `pg_attrdef` has a row for the column. PostgreSQL
+// answers NULL for a NULL expression anyway, but RisingWave 3.0.4 answers '' - and its
+// pg_attrdef is always empty - so an unguarded call gave every column there an empty
+// default, which the schema diagram prints as "Default: '' (empty string)" (#1075).
 const CTE_OBJECT_COLUMNS = `
         object_columns AS (
           SELECT
-            json_agg(
-              json_build_object(
+            jsonb_agg(
+              jsonb_build_object(
                 'name', a.attname,
                 'type', format_type(a.atttypid, NULL),
                 'nullable', NOT a.attnotnull,
-                'defaultValue', pg_get_expr(ad.adbin, ad.adrelid)
+                'defaultValue', CASE WHEN ad.adbin IS NOT NULL THEN pg_get_expr(ad.adbin, ad.adrelid) END
               ) ORDER BY a.attnum
             ) AS columns
           FROM pg_catalog.pg_attribute a
@@ -1210,8 +1212,8 @@ const CTE_OBJECT_COLUMNS = `
         )`;
 
 // One object's columns, primary key, foreign keys and indexes. The last three reuse the
-// schema query's own CTEs, so a fork that needs `withoutForeignKeyCatalog()` or
-// `withoutJsonAggFunctions()` gets the same repair here that `getSchema()` gets.
+// schema query's own CTEs, so a fork that needs `withoutForeignKeyCatalog()` gets the same
+// repair here that `getSchema()` gets.
 //
 // The `AS MATERIALIZED` hints are stripped, which is the opposite of what the schema
 // queries want and for the opposite reason. There, the CTEs are each read by several
@@ -1228,10 +1230,10 @@ const CTE_OBJECT_COLUMNS = `
 const OBJECT_DETAIL_SQL = withoutMaterializedHint(`
         WITH ${CTE_OBJECT_COLUMNS},${CTE_PK_INFO},${CTE_FK_INFO},${CTE_INDEX_INFO}
         SELECT
-          COALESCE(oc.columns, '[]'::json) as columns,
+          COALESCE(oc.columns, '[]'::jsonb) as columns,
           COALESCE(pk.pk_columns, ARRAY[]::text[]) as pk_columns,
-          COALESCE(fk.foreign_keys, '[]'::json) as foreign_keys,
-          COALESCE(ii.indexes, '[]'::json) as indexes
+          COALESCE(fk.foreign_keys, '[]'::jsonb) as foreign_keys,
+          COALESCE(ii.indexes, '[]'::jsonb) as indexes
         FROM object_columns oc
         LEFT JOIN pk_info pk ON pk.table_schema = $1 AND pk.table_name = $2
         LEFT JOIN fk_info fk ON fk.table_schema = $1 AND fk.table_name = $2
@@ -1298,12 +1300,12 @@ function bulkDetailSql(relkinds: string, bound?: number): string {
         described_columns AS (
           SELECT
             d.relname,
-            json_agg(
-              json_build_object(
+            jsonb_agg(
+              jsonb_build_object(
                 'name', a.attname,
                 'type', format_type(a.atttypid, NULL),
                 'nullable', NOT a.attnotnull,
-                'defaultValue', pg_get_expr(ad.adbin, ad.adrelid)
+                'defaultValue', CASE WHEN ad.adbin IS NOT NULL THEN pg_get_expr(ad.adbin, ad.adrelid) END
               ) ORDER BY a.attnum
             ) AS columns
           FROM described d
@@ -1314,10 +1316,10 @@ function bulkDetailSql(relkinds: string, bound?: number): string {
         ),${CTE_PK_INFO},${CTE_FK_INFO},${CTE_INDEX_INFO}
         SELECT
           d.relname AS name,
-          COALESCE(dc.columns, '[]'::json) as columns,
+          COALESCE(dc.columns, '[]'::jsonb) as columns,
           COALESCE(pk.pk_columns, ARRAY[]::text[]) as pk_columns,
-          COALESCE(fk.foreign_keys, '[]'::json) as foreign_keys,
-          COALESCE(ii.indexes, '[]'::json) as indexes
+          COALESCE(fk.foreign_keys, '[]'::jsonb) as foreign_keys,
+          COALESCE(ii.indexes, '[]'::jsonb) as indexes
         FROM described d
         LEFT JOIN described_columns dc ON dc.relname = d.relname
         LEFT JOIN pk_info pk ON pk.table_schema = $1 AND pk.table_name = d.relname
@@ -2065,18 +2067,45 @@ export class PostgresProvider extends SQLBaseProvider {
       // kind an engine cannot answer for is absent from the declaration and is never declared
       // and then refused, which is standing ruling 4 one level down.
       //
+      // The SAME four kinds `RELKIND_BY_KIND` holds declare `hasColumns`, and they declare it
+      // BY READING THAT MAP (#789, columns under an object row). One writer, not a
+      // transcription: `describeObject` gates on the very same map (`:2969-2972`) and answers
+      // three empty arrays without a round trip for anything that is not a key in it, so a kind
+      // leaving the map can never keep a twisty that opens on nothing. `RELKIND_BY_KIND` is a
+      // module-level const evaluated long before this method runs, so there is no
+      // temporal-dead-zone hazard in reading it here.
+      //
+      // `sequence` is the row that proves this cannot be read off `role`: it is `role: "config"`
+      // and it answers `last_value`, `log_cnt` and `is_called` out of `pg_attribute`, while
+      // Oracle's kind of the same id answers none because that provider gates on the role.
+      //
       // No `index` kind, deliberately. PostgreSQL's own catalog models an index as a
       // property of the relation it is on - `pg_index` is keyed by `indrelid` and an
       // index cannot exist without one - so it belongs in `describeObject`'s output,
       // where it already is, rather than in a container-level folder of its own.
       objectKinds: [
-        { id: "table", role: "relation", label: "Table", labelPlural: "Tables", acceptsRowWrites: true },
+        {
+          id: "table",
+          role: "relation",
+          label: "Table",
+          labelPlural: "Tables",
+          acceptsRowWrites: true,
+          hasColumns: hasColumns("table"),
+        },
         // No `acceptsRowWrites`. PostgreSQL does accept an UPDATE against a simple
         // updatable view and against any view carrying an INSTEAD OF trigger, and the
         // provider still declares nothing: whether a given view is one of those is a
         // per-object fact this declaration is per-kind, so claiming it would offer an
         // import target that fails on most views in most schemas.
-        { id: "view", role: "relation", label: "View", labelPlural: "Views", hasSource: true, sourceLanguage: "pgsql" },
+        {
+          id: "view",
+          role: "relation",
+          label: "View",
+          labelPlural: "Views",
+          hasSource: true,
+          sourceLanguage: "pgsql",
+          hasColumns: hasColumns("view"),
+        },
         {
           id: "materialized_view",
           role: "relation",
@@ -2084,8 +2113,15 @@ export class PostgresProvider extends SQLBaseProvider {
           labelPlural: "Materialized Views",
           hasSource: true,
           sourceLanguage: "pgsql",
+          hasColumns: hasColumns("materialized_view"),
         },
-        { id: "sequence", role: "config", label: "Sequence", labelPlural: "Sequences" },
+        {
+          id: "sequence",
+          role: "config",
+          label: "Sequence",
+          labelPlural: "Sequences",
+          hasColumns: hasColumns("sequence"),
+        },
         {
           id: "function",
           role: "routine",
@@ -2719,26 +2755,27 @@ export class PostgresProvider extends SQLBaseProvider {
   // ============================================================================
 
   /**
-   * Runs a schema-introspection query built from `AS MATERIALIZED` CTEs,
-   * `pg_total_relation_size()` and `json_agg()`/`json_build_object()`. Real
-   * PostgreSQL accepts all of these and this succeeds on the first try. Three
-   * independent things can reject it on a wire-compatible relative, and each
-   * engine can hit them in a different order or subset: Materialize/RisingWave
-   * reserve MATERIALIZED as a keyword (their own CREATE MATERIALIZED VIEW
-   * grammar) and reject the CTE modifier outright; CockroachDB and Materialize
-   * both lack `pg_total_relation_size()`; Materialize also has no `json_agg()`/
-   * `json_build_object()`, only the `jsonb_` equivalents. Every fallback is
-   * matched against whichever error actually comes back, not tried in a fixed
-   * order, so one engine hitting only the second or third gap still recovers.
-   * Recovers real object-browser data on those engines instead of failing outright;
-   * any error no fallback recognizes, or one that survives every applicable
-   * fallback, is mapped and rethrown rather than left raw.
+   * Runs a schema-introspection query built from catalog reads a wire-compatible
+   * relative may lack. Real PostgreSQL has all of them and this succeeds on the
+   * first try. Independent gaps can reject it on a relative, and each engine can hit
+   * them in a different order or subset: CockroachDB and Materialize both lack
+   * `pg_total_relation_size()`; Materialize and RisingWave have no
+   * `information_schema.constraint_column_usage`. Every fallback is matched against
+   * whichever error actually comes back, not tried in a fixed order, so one engine
+   * hitting only a later gap still recovers. Recovers real object-browser data on
+   * those engines instead of failing outright; any error no fallback recognizes, or
+   * one that survives every applicable fallback, is mapped and rethrown rather than
+   * left raw.
+   *
+   * No statement that reaches this chain carries an `AS MATERIALIZED` hint: each has
+   * it stripped where it is defined, so there is no keyword collision left to repair.
+   * A matcher for one used to sit first here, and matched any message naming the word -
+   * including RisingWave's constraint_column_usage refusal, which recommends `SHOW
+   * MATERIALIZED VIEWS` - so it spent a retry resending an identical statement (#1075).
    */
   private async queryWithMaterializedFallback(client: PoolClient, sql: string, params?: unknown[]) {
     const remainingFallbacks = [
-      { matches: isMaterializedKeywordSyntaxError, apply: withoutMaterializedHint },
       { matches: isMissingTotalRelationSizeError, apply: withoutTotalRelationSizeFn },
-      { matches: isMissingJsonAggError, apply: withoutJsonAggFunctions },
       { matches: isMissingConstraintColumnUsageError, apply: withoutForeignKeyCatalog },
       { matches: isMissingExtensionCatalogError, apply: withoutExtensionOwnershipTest },
       { matches: isMissingToRegclassError, apply: withoutToRegclass },

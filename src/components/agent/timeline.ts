@@ -189,7 +189,8 @@ export interface AgentTimelineItem {
   readonly isAnswer?: true;
   /**
    * What the RUN already did with this entry's statement, when the entry is an
-   * answer the run handed to the editor (§2.3 of `docs/AGENT_ANALYST_DESIGN.md`).
+   * answer the run handed to the editor (see the "Handing the answer to the editor
+   * (auto-execute)" section of `docs/AGENT.md`).
    *
    * Present only for a handover that happened: `none` is the setting being off, and
    * carrying it here would ask the rail to act on a decision to do nothing. The
@@ -1200,6 +1201,17 @@ function describeEvent(
         },
       };
     }
+    case "run-paused":
+      return {
+        tone: "progress",
+        headline: "Paused",
+        detail: "The run is paused; resume it to continue from where it stopped.",
+      };
+    case "run-resumed":
+      return {
+        tone: "progress",
+        headline: "Resumed",
+      };
     default:
       return {
         tone: TERMINAL_TONES[event.status],
@@ -1549,6 +1561,10 @@ export function foldLedgerEntries(entries: readonly AgentLedgerEntry[]): AgentRu
       if (event.kind === "run-started") {
         status = "running";
         mode = event.mode;
+      } else if (event.kind === "run-paused") {
+        status = "paused";
+      } else if (event.kind === "run-resumed") {
+        status = "running";
       } else if (event.kind === "run-finished") {
         status = event.status;
         failureReason = event.reason ?? null;

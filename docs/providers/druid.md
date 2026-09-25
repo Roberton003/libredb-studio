@@ -810,6 +810,22 @@ global `fetch` cannot carry a custom CA or relax verification without an undici 
 fails verification; one with a publicly-trusted certificate works. Honouring them needs the
 `node:https` path Couchbase already has, which is a follow-up rather than a limitation of the scheme.
 
+
+### 4.4 Endpoint validation and redirects
+
+`host` and `port` are validated when the transport is constructed, which happens in `connect()`, so
+a bad value fails Test Connection and never a capability read. A host must be a hostname, an IPv4
+address or an IPv6 address (bracketed or not), and a port must be an integer from 1 to 65535.
+Anything else is a `DatabaseConfigError` that names the field and does not repeat the value.
+Every request URL is built by the shared [`endpoint.ts`](../../src/lib/db/http/endpoint.ts) with
+`URL` and `URLSearchParams` and checked against the intended hostname, port and path before it is
+sent, so no value can move a request to another path or another server. A scheme's default port
+(80 for `http`, 443 for `https`) is left out of the URL the way `URL` serializes it.
+
+Redirects are not followed. Every request sets `redirect: "manual"`, and a 3xx answer becomes a
+`ConnectionError` naming the status and only the origin of its `Location`, since a followed
+redirect would take the Basic credential and the statement to wherever the server pointed.
+
 ---
 
 ## 5. Query interface
@@ -1235,6 +1251,14 @@ every column including `__time`, are all stated once (§6 above).
 `indexes` and `foreignKeys` are always `[]`, by construction rather than by omission, for the same
 two reasons the object surface gives. Zero columns **raises**: every object of every declared kind has at
 least one column, so an empty answer means the object is not there under that name in this schema.
+
+All three kinds declare `hasColumns`, so every object row in the tree expands and there is no kind
+here whose `describeObject` answers `columns: []` (#789). That makes Druid one of the three engines
+whose conformance expectation must set `noAbstainingKinds`: the invariant's negative direction, which
+asserts that a kind declaring nothing answers no column, iterates zero times on this provider, and the
+positive direction is the only one carrying it. `lookup` is the case worth naming: it is
+`role: "config"` and it answers `k` and `v`, which is why the twisty is decided by the declaration and
+never by the role.
 
 `DatabaseObject` carries no `rowCount` and no `sizeBytes` here. Both would have to come from
 `sys.segments`, and nothing in this surface reads `sys` on purpose: a cluster running
