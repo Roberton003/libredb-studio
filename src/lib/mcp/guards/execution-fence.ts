@@ -11,12 +11,12 @@ class McpSecurityViolationError extends Error {
 }
 
 /**
- * Valida se uma instrução SQL é estritamente segura para execução em modo leitura via MCP.
- * Reutiliza a cerca nativa do LibreDB Studio (`inspectAgentStatement`), bloqueando DDL, DML,
- * multi-statements, transações manuais e palavras-chave de efeito colateral.
+ * Validates that an SQL statement is strictly safe for read-only execution via MCP.
+ * Reuses LibreDB Studio's native execution fence (`inspectAgentStatement`), blocking DDL, DML,
+ * multi-statements, manual transactions, and side-effect keywords.
  *
- * @param sql Instrução SQL a ser inspecionada
- * @throws McpSecurityViolationError se houver qualquer violação
+ * @param sql SQL statement to inspect
+ * @throws McpSecurityViolationError if any violation is detected
  */
 export function assertReadOnlyStatement(sql: string): void {
   const violation = inspectAgentStatement(sql, { allowPlanExecution: false });
@@ -26,8 +26,8 @@ export function assertReadOnlyStatement(sql: string): void {
 }
 
 /**
- * Versão não-excepcional da cerca de execução.
- * Retorna null se seguro, ou o código da violação caso rejeitado.
+ * Non-throwing version of the execution fence.
+ * Returns null if safe, or the violation code if rejected.
  */
 export function checkReadOnlyStatement(sql: string): AgentStatementViolation | null {
   return inspectAgentStatement(sql, { allowPlanExecution: false });

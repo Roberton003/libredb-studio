@@ -1,4 +1,4 @@
-import { describe, expect, mock, spyOn, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { McpConnectionContext } from "@/lib/mcp/context";
 import { McpCancellationManager } from "@/lib/mcp/guards/cancellation";
 import { executeListConnections } from "@/lib/mcp/tools/list-connections";
@@ -16,14 +16,14 @@ describe("MCP Edge Cases & Full Line Coverage", () => {
     createdAt: new Date(),
   };
 
-  test("executeListConnections retorna isError quando os parâmetros são inválidos", async () => {
+  test("executeListConnections returns isError when parameters are invalid", async () => {
     const context = new McpConnectionContext([dummyConn]);
     const res = await executeListConnections({ environment: 123 as any }, context);
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toContain("Failed to list connections");
   });
 
-  test("executeInspectSchema cobre include_columns, include_indexes, falha de describeObject e schema inexistente", async () => {
+  test("executeInspectSchema covers include_columns, include_indexes, describeObject failure and non-existent schema", async () => {
     let describeThrows = false;
     const mockProvider = {
       listContainers: async () => [{ name: "main", path: ["main"] }],
@@ -32,7 +32,7 @@ describe("MCP Edge Cases & Full Line Coverage", () => {
         { name: "logs", path: ["main", "logs"], kind: "table" },
       ],
       describeObject: async () => {
-        if (describeThrows) throw new Error("Falha no describe");
+        if (describeThrows) throw new Error("Describe failed");
         return {
           columns: [
             { name: "id", type: "INTEGER", nullable: false, defaultValue: 1, isPrimary: true },
@@ -50,7 +50,7 @@ describe("MCP Edge Cases & Full Line Coverage", () => {
       },
     };
 
-    // 1. Inspecionar com colunas e índices
+    // 1. Inspect with columns and indexes
     const resWithCols = await executeInspectSchema(
       { connection_id: "edge-conn", table: "users", include_columns: true, include_indexes: true },
       mockContext,
@@ -59,15 +59,16 @@ describe("MCP Edge Cases & Full Line Coverage", () => {
     expect(resWithCols.content[0].text).toContain("idx_users_id");
     expect(resWithCols.content[0].text).toContain("username");
 
-    // 2. Describe falhando
+    // 2. Describe failure bubbles up as isError: true
     describeThrows = true;
     const resDescribeFail = await executeInspectSchema(
       { connection_id: "edge-conn", include_columns: true },
       mockContext,
     );
-    expect(resDescribeFail.content[0].text).toContain("[Partial schema: failed to describe columns]");
+    expect(resDescribeFail.isError).toBe(true);
+    expect(resDescribeFail.content[0].text).toContain("Describe failed");
 
-    // 3. Schema inexistente
+    // 3. Non-existent schema
     const resMissingSchema = await executeInspectSchema(
       { connection_id: "edge-conn", schema: "non_existent_schema" },
       mockContext,
@@ -75,18 +76,18 @@ describe("MCP Edge Cases & Full Line Coverage", () => {
     expect(resMissingSchema.isError).toBe(true);
     expect(resMissingSchema.content[0].text).toContain('Schema "non_existent_schema" not found');
 
-    // 4. Erro fatal ao obter provider
+    // 4. Fatal error acquiring provider
     const failingContext: any = {
       getProvider: async () => {
-        throw new Error("Conexão indisponível");
+        throw new Error("Connection unavailable");
       },
     };
     const resFatal = await executeInspectSchema({ connection_id: "broken" }, failingContext);
     expect(resFatal.isError).toBe(true);
-    expect(resFatal.content[0].text).toContain("Conexão indisponível");
+    expect(resFatal.content[0].text).toContain("Connection unavailable");
   });
 
-  test("executeRunReadQuery cobre pre-aborted signal, invalid args, provider cancelQuery, timeout e listener", async () => {
+  test("executeRunReadQuery covers pre-aborted signal, invalid args, provider cancelQuery, timeout, and listener", async () => {
     const manager = new McpCancellationManager();
 
     // 1. Pre-aborted signal
@@ -97,12 +98,12 @@ describe("MCP Edge Cases & Full Line Coverage", () => {
     expect(resPreAbort.isError).toBe(true);
     expect(resPreAbort.content[0].text).toContain("cancelled upfront");
 
-    // 2. Parâmetros inválidos (ZodError)
+    // 2. Invalid parameters (ZodError)
     const resInvalidArgs = await executeRunReadQuery({ connection_id: 123 as any, sql: "" }, {} as any);
     expect(resInvalidArgs.isError).toBe(true);
     expect(resInvalidArgs.content[0].text).toContain("Invalid parameters");
 
-    // 3. Aborted signal durante conexão com o banco
+    // 3. Aborted signal during connection to database
     const abortCtrl = new AbortController();
     const slowContext: any = {
       getConnection: () => dummyConn,
@@ -117,7 +118,7 @@ describe("MCP Edge Cases & Full Line Coverage", () => {
     expect(resAbortedMid.isError).toBe(true);
     expect(resAbortedMid.content[0].text).toContain("aborted during connect");
 
-    // 4. Provider com cancelQuery e abort event listener acionado
+    // 4. Provider with cancelQuery and abort event listener triggered
     let providerCancelCalled = false;
     const mockProvider = {
       readOnlyProfile: true,
@@ -166,7 +167,7 @@ describe("MCP Edge Cases & Full Line Coverage", () => {
     expect(timeoutRes.content[0].text).toContain("Timeout after 500ms");
   });
 
-  test("executeRunReadQuery cobre redução geométrica de linhas (Passo B)", async () => {
+  test("executeRunReadQuery covers geometric reduction of rows (Step B)", async () => {
     const massiveRows: any[] = [];
     for (let i = 0; i < 100; i++) {
       const row: any = { id: i };
@@ -197,8 +198,8 @@ describe("MCP Edge Cases & Full Line Coverage", () => {
     expect(bytes).toBeLessThanOrEqual(65536);
   });
 
-  test("executeRunReadQuery cobre poda de colunas excedentes (Passo D) quando uma única linha excede o orçamento", async () => {
-    // 1 linha com 2000 colunas
+  test("executeRunReadQuery covers pruning excess columns (Step D) when a single row exceeds budget", async () => {
+    // 1 row with 2000 columns
     const singleRow: Record<string, unknown> = {};
     const fieldsList: Array<{ name: string }> = [];
     for (let c = 0; c < 2000; c++) {
@@ -229,13 +230,13 @@ describe("MCP Edge Cases & Full Line Coverage", () => {
     expect(bytes).toBeLessThanOrEqual(65536);
   });
 
-  test("McpConnectionContext.disconnectAll captura exceções de providers sem quebrar", async () => {
+  test("McpConnectionContext.disconnectAll catches provider exceptions without throwing", async () => {
     const secret = "synthetic_disconnect_secret";
     const warnings: string[] = [];
     const warnSpy = spyOn(console, "warn").mockImplementation((...args) => warnings.push(args.join(" ")));
     const brokenProvider: any = {
       disconnect: async () => {
-        throw Object.assign(new Error("Falha ao desconectar provider remoto"), { password: secret });
+        throw Object.assign(new Error("Failed to disconnect remote provider"), { password: secret });
       },
     };
     McpConnectionContext.setCachedProvider("broken-conn", undefined, brokenProvider);
@@ -250,7 +251,7 @@ describe("MCP Edge Cases & Full Line Coverage", () => {
     }
   });
 
-  test("executeInspectSchema trunca mais de 25 índices e corta tabelas quando payload excede 64 KiB", async () => {
+  test("executeInspectSchema truncates more than 25 indexes and cuts tables when payload exceeds 64 KiB", async () => {
     const manyIndexes = Array.from({ length: 30 }, (_, i) => ({
       name: `idx_${i}`,
       columns: ["col_1"],
@@ -290,11 +291,29 @@ describe("MCP Edge Cases & Full Line Coverage", () => {
     expect(parsed.tables.length).toBeLessThan(3);
   });
 
-  test("McpConnectionContext cobre getConnection, closeAll e resetGlobalCache", async () => {
+  test("McpConnectionContext covers getConnection, closeAll, and resetGlobalCache", async () => {
     const ctx = new McpConnectionContext([dummyConn]);
     expect(ctx.getConnection("edge-conn")).toEqual(dummyConn);
     expect(ctx.getConnection("non-existent")).toBeUndefined();
     await expect(ctx.closeAll()).resolves.toBeUndefined();
     await expect(McpConnectionContext.resetGlobalCache()).resolves.toBeUndefined();
+  });
+
+  test("executeRunReadQuery rejects positive offset when provider does not support result pagination", async () => {
+    const unsupportingProvider = {
+      readOnlyProfile: true,
+      getCapabilities: () => ({ supportsResultPagination: false }),
+      prepareQuery: (sql: string, opts: any) => ({ query: sql, limit: opts.limit, offset: opts.offset, wasLimited: false }),
+      queryReadOnly: async () => ({ rows: [], fields: [] }),
+    };
+    const mockContext: any = {
+      getProvider: async () => unsupportingProvider,
+    };
+    const res = await executeRunReadQuery(
+      { connection_id: "edge-conn", sql: "SELECT 1", offset: 10 },
+      mockContext,
+    );
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("does not support result pagination (offset)");
   });
 });

@@ -1,5 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import { guardRoute } from "@/lib/api/require-session";
+import { consumeRateLimit, RateLimitError } from "@/lib/api/rate-limit";
+import { createErrorResponse } from "@/lib/api/errors";
+import { clientAddress } from "@/lib/api/client-address";
+import { emitAuditEvent } from "@/lib/audit";
 import { getManagedConnections } from "@/lib/seed";
 import { McpConnectionContext } from "@/lib/mcp/context";
 import { McpDispatcher } from "@/lib/mcp/dispatcher";
@@ -34,7 +38,7 @@ const globalMcpCancellationManager = new McpCancellationManager();
  */
 export async function POST(req: NextRequest) {
   // 1. Session verification & Rate Limiting via standard LibreDB guardRoute
-  const guard = await guardRoute({ route: "POST /api/mcp", bucket: "ai", request: req });
+  const guard = await guardRoute({ route: "POST /api/mcp", bucket: "query", request: req });
   if ("response" in guard) {
     return guard.response;
   }
@@ -56,6 +60,42 @@ export async function POST(req: NextRequest) {
       },
       { status: 400 },
     );
+  }
+
+  // 3. Batch Rate Limiting: guardRoute consumed 1 slot on "query".
+  // For batch requests, meter additional database-reaching calls (run_read_query, inspect_schema).
+  if (Array.isArray(body)) {
+    const dbCalls = body.filter(
+      (r: any) =>
+        r &&
+        typeof r === "object" &&
+        r.method === "tools/call" &&
+        (r.params?.name === "run_read_query" || r.params?.name === "inspect_schema"),
+    ).length;
+
+    const extraCalls = Math.max(0, dbCalls - 1);
+    for (let i = 0; i < extraCalls; i++) {
+      const decision = consumeRateLimit("query", session.username);
+      if (!decision.allowed) {
+        if (decision.tripped) {
+          try {
+            emitAuditEvent({
+              type: "rate_limit_exceeded",
+              action: "throttled",
+              target: "POST /api/mcp",
+              user: session.username,
+              result: "failure",
+              reason: "rate_limited",
+              ip: clientAddress(req),
+              bucket: "query",
+            });
+          } catch (auditError) {
+            logger.error("Failed to record rate_limit_exceeded audit event", auditError, { route: "POST /api/mcp" });
+          }
+        }
+        return createErrorResponse(new RateLimitError(decision.retryAfterSeconds), { route: "POST /api/mcp" });
+      }
+    }
   }
 
   // 3. Resolve accessible connections based on authenticated role

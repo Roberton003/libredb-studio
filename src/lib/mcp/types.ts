@@ -70,6 +70,7 @@ export const RunReadQueryInputSchema = z.object({
   connection_id: z.string().min(1, "connection_id is required"),
   sql: z.string().min(1, "SQL cannot be empty"),
   max_rows: z.number().int().min(1).max(500).default(100),
+  offset: z.number().int().min(0).default(0),
   timeout_ms: z.number().int().min(500).max(30000).default(10000),
 });
 

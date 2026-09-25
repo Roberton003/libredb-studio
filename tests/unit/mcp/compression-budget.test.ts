@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { executeRunReadQuery } from "@/lib/mcp/tools/run-read-query";
 import type { McpConnectionContext } from "@/lib/mcp/context";
 
-describe("MCP Progressive Budget Compression (64 KiB Defensivo)", () => {
+describe("MCP Progressive Budget Compression (64 KiB Defensive)", () => {
   const createMockContext = (rows: any[], fields: string[]): McpConnectionContext => {
     const mockProvider = {
       readOnlyProfile: true,
@@ -20,7 +20,7 @@ describe("MCP Progressive Budget Compression (64 KiB Defensivo)", () => {
     } as unknown as McpConnectionContext;
   };
 
-  test("respeita o teto de 64 KiB mesmo quando a consulta retorna 10.000 colunas nos metadados", async () => {
+  test("respects 64 KiB ceiling even when query returns 10,000 columns in metadata", async () => {
     const fields = Array.from({ length: 10000 }, (_, i) => `column_${i}`);
     const rows = [{ column_0: "test-value" }];
     const ctx = createMockContext(rows, fields);
@@ -37,7 +37,7 @@ describe("MCP Progressive Budget Compression (64 KiB Defensivo)", () => {
     expect(envelope.fields.length).toBeLessThanOrEqual(51);
   });
 
-  test("trunca objetos JSON aninhados profundos evitando payload excessivo", async () => {
+  test("truncates deep nested JSON objects preventing excessive payload", async () => {
     const giantPayload = { nested: "X".repeat(200000) };
     const rows = [{ id: 1, payload: giantPayload }];
     const ctx = createMockContext(rows, ["id", "payload"]);
@@ -58,7 +58,7 @@ describe("MCP Progressive Budget Compression (64 KiB Defensivo)", () => {
     expect(envelope.rows[0].payload).toContain("[TRUNCATED OBJECT]");
   });
 
-  test("não trunca consultas que cabem com folga dentro do orçamento", async () => {
+  test("does not truncate queries that easily fit within budget", async () => {
     const rows = Array.from({ length: 10 }, (_, i) => ({
       id: i + 1,
       name: `User ${i + 1}`,
@@ -77,8 +77,8 @@ describe("MCP Progressive Budget Compression (64 KiB Defensivo)", () => {
     expect(envelope.rows.length).toBe(10);
   });
 
-  test("respeita o teto de 64 KiB mesmo com nomes de colunas gigantescos e chaves patológicas", async () => {
-    // 5 colunas com nomes de 50.000 caracteres cada
+  test("respects 64 KiB ceiling even with giant column names and pathological keys", async () => {
+    // 5 columns with names of 50,000 characters each
     const giantColName = "col_".repeat(12500);
     const fields = [giantColName];
     const rows = [{ [giantColName]: "short-val" }];
@@ -96,7 +96,7 @@ describe("MCP Progressive Budget Compression (64 KiB Defensivo)", () => {
     expect(envelope.truncated).toBe(true);
   });
 
-  test("garante concordância exata entre envelope.byte_size e os bytes reais serializados no fio (sem subcontagem)", async () => {
+  test("guarantees exact match between envelope.byte_size and real serialized wire bytes (no undercounting)", async () => {
     const rows = Array.from({ length: 50 }, (_, i) => ({
       id: i,
       name: `Entity ${i}`,

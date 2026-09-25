@@ -20,7 +20,7 @@ describe("MCP Dispatcher (JSON-RPC 2.0 Engine)", () => {
   const context = new McpConnectionContext([mockConnection]);
   const dispatcher = new McpDispatcher(context, cancellationManager);
 
-  test("processa requisição 'initialize' e retorna handshake 2024-11-05", async () => {
+  test("processes 'initialize' request and returns 2024-11-05 handshake", async () => {
     const request = {
       jsonrpc: "2.0",
       id: 1,
@@ -41,7 +41,7 @@ describe("MCP Dispatcher (JSON-RPC 2.0 Engine)", () => {
     expect(response.result.capabilities.tools.listChanged).toBe(false);
   });
 
-  test("retorna null para notificação 'notifications/initialized'", async () => {
+  test("returns null for 'notifications/initialized' notification", async () => {
     const notification = {
       jsonrpc: "2.0",
       method: "notifications/initialized",
@@ -51,7 +51,7 @@ describe("MCP Dispatcher (JSON-RPC 2.0 Engine)", () => {
     expect(response).toBeNull();
   });
 
-  test("processa requisição 'ping' e responde vazio", async () => {
+  test("processes 'ping' request and returns empty result", async () => {
     const request = {
       jsonrpc: "2.0",
       id: 99,
@@ -64,7 +64,7 @@ describe("MCP Dispatcher (JSON-RPC 2.0 Engine)", () => {
     expect(response.result).toEqual({});
   });
 
-  test("lista ferramentas com 'tools/list'", async () => {
+  test("lists tools with 'tools/list'", async () => {
     const request = {
       jsonrpc: "2.0",
       id: "req-list",
@@ -82,7 +82,7 @@ describe("MCP Dispatcher (JSON-RPC 2.0 Engine)", () => {
     expect(toolNames).toContain("run_read_query");
   });
 
-  test("executa 'tools/call' para 'list_connections' com sucesso", async () => {
+  test("executes 'tools/call' for 'list_connections' successfully", async () => {
     const request = {
       jsonrpc: "2.0",
       id: 42,
@@ -105,7 +105,7 @@ describe("MCP Dispatcher (JSON-RPC 2.0 Engine)", () => {
     expect(parsedData[0].read_only).toBe(true);
   });
 
-  test("retorna isError: true para ferramenta inexistente", async () => {
+  test("returns isError: true for non-existent tool", async () => {
     const request = {
       jsonrpc: "2.0",
       id: 101,
@@ -122,7 +122,7 @@ describe("MCP Dispatcher (JSON-RPC 2.0 Engine)", () => {
     expect(response.result.content[0].text).toContain("Unknown tool");
   });
 
-  test("rejeita método inexistente com erro METHOD_NOT_FOUND (-32601)", async () => {
+  test("rejects non-existent method with METHOD_NOT_FOUND (-32601)", async () => {
     const request = {
       jsonrpc: "2.0",
       id: "bad-method",
@@ -135,7 +135,7 @@ describe("MCP Dispatcher (JSON-RPC 2.0 Engine)", () => {
     expect(response.error.code).toBe(JSON_RPC_ERRORS.METHOD_NOT_FOUND);
   });
 
-  test("rejeita requisição malformada com erro INVALID_REQUEST (-32600)", async () => {
+  test("rejects malformed request with INVALID_REQUEST (-32600)", async () => {
     const request = {
       invalid_jsonrpc: "1.0",
       id: 123,
@@ -145,7 +145,7 @@ describe("MCP Dispatcher (JSON-RPC 2.0 Engine)", () => {
     expect(response.error.code).toBe(JSON_RPC_ERRORS.INVALID_REQUEST);
   });
 
-  test("processa requisições em lote (Batch)", async () => {
+  test("processes batch requests", async () => {
     const batch = [
       { jsonrpc: "2.0", id: 1, method: "ping" },
       { jsonrpc: "2.0", id: 2, method: "tools/list" },
@@ -158,7 +158,7 @@ describe("MCP Dispatcher (JSON-RPC 2.0 Engine)", () => {
     expect(responses[1].id).toBe(2);
   });
 
-  test("rejeita IDs inválidos (null, float, objeto) com INVALID_REQUEST (-32600)", async () => {
+  test("rejects invalid IDs (null, float, object) with INVALID_REQUEST (-32600)", async () => {
     const rNull = (await dispatcher.handle({ jsonrpc: "2.0", id: null, method: "ping" })) as any;
     expect(rNull.error.code).toBe(JSON_RPC_ERRORS.INVALID_REQUEST);
 
@@ -169,7 +169,7 @@ describe("MCP Dispatcher (JSON-RPC 2.0 Engine)", () => {
     expect(rObj.error.code).toBe(JSON_RPC_ERRORS.INVALID_REQUEST);
   });
 
-  test("rejeita lote que excede limite de 50 requisições com INVALID_REQUEST", async () => {
+  test("rejects batch exceeding 50 request limit with INVALID_REQUEST", async () => {
     const hugeBatch = Array.from({ length: 51 }, (_, i) => ({
       jsonrpc: "2.0",
       id: i + 1,
@@ -181,7 +181,7 @@ describe("MCP Dispatcher (JSON-RPC 2.0 Engine)", () => {
     expect(response.error.message).toContain("limit of 50");
   });
 
-  test("processa notificação notifications/cancelled chamando cancellationManager", async () => {
+  test("processes notifications/cancelled notification calling cancellationManager", async () => {
     let cancelled = false;
     cancellationManager.register("test-user", "test-req-1", "conn-x", async () => {
       cancelled = true;
@@ -200,7 +200,7 @@ describe("MCP Dispatcher (JSON-RPC 2.0 Engine)", () => {
     expect(cancelled).toBe(true);
   });
 
-  test("redige credenciais e URIs em mensagens de erro internas capturadas no dispatcher e no logger", async () => {
+  test("redacts credentials and URIs in internal error messages caught in dispatcher and logger", async () => {
     const syntheticPassword = "dummy_test_password";
     const syntheticToken = "dummy_test_bearer_token";
 
@@ -235,7 +235,7 @@ describe("MCP Dispatcher (JSON-RPC 2.0 Engine)", () => {
         params: { name: "list_connections" },
       })) as any;
 
-      // 1. O cliente não recebe o secret
+      // 1. Client does not receive secret
       expect(explodeResponse.id).toBe(1000);
       expect(explodeResponse.error.code).toBe(JSON_RPC_ERRORS.INTERNAL_ERROR);
       expect(explodeResponse.error.message).not.toContain(syntheticPassword);
@@ -243,7 +243,7 @@ describe("MCP Dispatcher (JSON-RPC 2.0 Engine)", () => {
       expect(JSON.stringify(explodeResponse)).not.toContain(syntheticPassword);
       expect(JSON.stringify(explodeResponse)).not.toContain(syntheticToken);
 
-      // 2. O logger não recebe o secret
+      // 2. Logger does not receive secret
       expect(loggedErrors.length).toBe(1);
       const logged = loggedErrors[0];
       expect(logged.msg).toBe("Error dispatching MCP request");
@@ -259,7 +259,7 @@ describe("MCP Dispatcher (JSON-RPC 2.0 Engine)", () => {
         expect(consoleMsg).not.toContain(syntheticToken);
       }
 
-      // 3. A mensagem redigida mantém informação diagnóstica útil
+      // 3. Redacted message maintains diagnostic value
       expect(explodeResponse.error.message).toContain("Fatal driver leak:");
       expect(explodeResponse.error.message).toContain("password=[REDACTED]");
       expect(explodeResponse.error.message).toContain("bearer [REDACTED]");
@@ -273,7 +273,7 @@ describe("MCP Dispatcher (JSON-RPC 2.0 Engine)", () => {
     }
   });
 
-  test("redige URIs com credenciais e tokens em query string no dispatcher e logger", async () => {
+  test("redacts URIs with credentials and query string tokens in dispatcher and logger", async () => {
     const syntheticUriSecret = "dummy_uri_password";
     const syntheticQueryToken = "dummy_query_token";
 
@@ -316,6 +316,70 @@ describe("MCP Dispatcher (JSON-RPC 2.0 Engine)", () => {
       );
     } finally {
       loggerErrorSpy.mockRestore();
+    }
+  });
+
+  test("preserves all response IDs and returns per-id error when batch response exceeds wire budget", async () => {
+    const customContext = {
+      listPublicConnections: () => [],
+    } as any;
+    const customDispatcher = new McpDispatcher(customContext);
+
+    // Mock executeTool to return a large payload (~25 KiB each)
+    let callCount = 0;
+    (customDispatcher as any).executeTool = async () => {
+      callCount++;
+      return {
+        content: [
+          {
+            type: "text",
+            text: "X".repeat(25 * 1024),
+          },
+        ],
+      };
+    };
+
+    const warnings: Array<{ msg: string; ctx?: any }> = [];
+    const warnSpy = spyOn(logger, "warn").mockImplementation((msg, ctx) => {
+      warnings.push({ msg, ctx });
+    });
+
+    try {
+      // 5 requests with IDs -> 5 * 25 KiB = 125 KiB, exceeds 64 KiB
+      const batch = Array.from({ length: 5 }, (_, i) => ({
+        jsonrpc: "2.0",
+        id: `batch-req-${i + 1}`,
+        method: "tools/call",
+        params: { name: "run_read_query" },
+      }));
+
+      const responses = (await customDispatcher.handle(batch)) as any[];
+      expect(responses).toBeArray();
+      expect(responses.length).toBe(5);
+      expect(callCount).toBe(5);
+
+      // Verify every request received a response matching its original ID
+      for (let i = 0; i < 5; i++) {
+        expect(responses[i].id).toBe(`batch-req-${i + 1}`);
+      }
+
+      // The earlier responses that fit returned the result
+      expect(responses[0].result).toBeDefined();
+
+      // The overflowing trailing responses were replaced with per-id errors
+      const overflowResponse = responses[responses.length - 1];
+      expect(overflowResponse.error).toBeDefined();
+      expect(overflowResponse.error.code).toBe(JSON_RPC_ERRORS.INTERNAL_ERROR);
+      expect(overflowResponse.error.message).toBe("Response exceeded the MCP batch output limit");
+
+      // Verify total serialized batch fits within 64 KiB
+      const totalWireBytes = Buffer.byteLength(JSON.stringify(responses), "utf-8");
+      expect(totalWireBytes).toBeLessThanOrEqual(64 * 1024);
+
+      // Verify warning log was emitted
+      expect(warnings.some((w) => w.msg.includes("MCP batch response wire budget exceeded"))).toBe(true);
+    } finally {
+      warnSpy.mockRestore();
     }
   });
 });

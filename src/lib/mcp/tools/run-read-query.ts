@@ -8,8 +8,9 @@ import {
   type RunReadQueryInput,
   RunReadQueryInputSchema,
 } from "../types";
+import { emitAuditEvent } from "@/lib/audit";
 
-const MAX_PAYLOAD_BYTES = 64 * 1024; // 64 KB teto defensivo para LLMs
+const MAX_PAYLOAD_BYTES = 64 * 1024; // 64 KB defensive ceiling for LLMs
 
 export interface RunReadQueryOptions {
   requestId?: string | number | null;
@@ -27,10 +28,11 @@ export async function executeRunReadQuery(
   context: McpConnectionContext,
   opts?: RunReadQueryOptions,
 ): Promise<McpCallResult> {
+  const startTime = Date.now();
   const signal = opts?.signal;
   const cancellationManager = opts?.cancellationManager;
 
-  // 0. Se a requisição já foi abortada pelo cliente antes de iniciar
+  // 0. If request was already aborted by client before starting
   if (signal?.aborted) {
     const reason = signal.reason || "Client cancelled request";
     return {
@@ -45,8 +47,10 @@ export async function executeRunReadQuery(
   }
 
   let args: RunReadQueryInput;
+  let parsedArgs: RunReadQueryInput | undefined;
   try {
     args = RunReadQueryInputSchema.parse(rawArgs);
+    parsedArgs = args;
   } catch (err: any) {
     return {
       isError: true,
@@ -91,7 +95,7 @@ export async function executeRunReadQuery(
     const provider = await context.getProvider(args.connection_id, "agent-read-only");
     providerRef = provider;
 
-    // Se o cliente abortou durante a inicialização/conexão do provider
+    // If client aborted during provider acquisition/connection
     if (signal?.aborted || cancelSignal?.aborted) {
       const reason = cancelSignal?.reason || signal?.reason || "Client cancelled request";
       return {
@@ -108,10 +112,23 @@ export async function executeRunReadQuery(
     const startTime = Date.now();
 
     // 3. Query preparation with pagination (Contract 0.16.2 / #816)
+    if (args.offset > 0) {
+      const supportsPagination =
+        typeof provider.getCapabilities === "function" &&
+        provider.getCapabilities().supportsResultPagination === true &&
+        typeof provider.prepareQuery === "function";
+
+      if (!supportsPagination) {
+        throw new Error(
+          `Provider for connection "${args.connection_id}" does not support result pagination (offset)`,
+        );
+      }
+    }
+
     const prepared =
       typeof provider.prepareQuery === "function"
-        ? provider.prepareQuery(args.sql, { limit: args.max_rows })
-        : { query: args.sql, limit: args.max_rows, offset: 0, wasLimited: false };
+        ? provider.prepareQuery(args.sql, { limit: args.max_rows, offset: args.offset })
+        : { query: args.sql, limit: args.max_rows, offset: args.offset, wasLimited: false };
 
     // 4. Protected execution with timeout
     const timeoutPromise = new Promise((_, reject) => {
@@ -158,12 +175,12 @@ export async function executeRunReadQuery(
     const rawRows = (rawResult.rows || []) as Array<Record<string, unknown>>;
     const originalCount = rawRows.length;
 
-    // 5. Paginação e teto de linhas (Contrato 0.16.2)
+    // 5. Pagination and row capping (Contract 0.16.2)
     const hasMore = prepared.wasLimited && originalCount === prepared.limit;
     const cappedRows = rawRows.slice(0, prepared.limit);
     let hasFieldTruncation = false;
 
-    // 6. Verificação do teto de bytes com Serializador Seguro e Medição no Envelope Completo (Wire Bytes)
+    // 6. Byte budget check with Safe Serializer and full wire envelope measurement
     let safeRows = safeSerialize(cappedRows) as Array<Record<string, unknown>>;
     let fields: Array<{ name: string }> | undefined = rawResult.fields?.map((f: unknown) => {
       const rawName = typeof f === "string" ? f : String(f);
@@ -211,7 +228,7 @@ export async function executeRunReadQuery(
         },
       };
 
-      // Estabiliza o cálculo iterativo de byte_size para garantir concordância absoluta com os bytes UTF-8 no fio
+      // Stabilize iterative byte_size calculation to match UTF-8 wire bytes
       let txt = safeJsonStringify(env, 2);
       for (let i = 0; i < 3; i++) {
         const currentBytes = Buffer.byteLength(txt, "utf-8");
@@ -237,14 +254,14 @@ export async function executeRunReadQuery(
         candidate = buildEnvelopeCandidate(safeRows, fields, truncated);
       }
 
-      // Passo B: Redução geométrica de linhas (75% por iteração)
+      // Step B: Geometric row reduction (75% per iteration)
       while (safeRows.length > 1 && candidate.wireBytes > MAX_PAYLOAD_BYTES) {
         safeRows = safeRows.slice(0, Math.floor(safeRows.length * 0.75));
         truncated = true;
         candidate = buildEnvelopeCandidate(safeRows, fields, truncated);
       }
 
-      // Passo C: Truncamento de chaves, strings e objetos aninhados profundos (256 -> 128 -> 64 -> 32 -> 16)
+      // Step C: Truncate deep strings, keys, and objects (256 -> 128 -> 64 -> 32 -> 16)
       if (candidate.wireBytes > MAX_PAYLOAD_BYTES && safeRows.length > 0) {
         let maxFieldLen = 256;
         while (candidate.wireBytes > MAX_PAYLOAD_BYTES && maxFieldLen >= 16) {
@@ -280,6 +297,16 @@ export async function executeRunReadQuery(
       }
     }
 
+    emitAuditEvent({
+      type: "agent_operation",
+      action: "run_read_query",
+      target: args.connection_id,
+      user: callerId,
+      result: "success",
+      duration: executionTimeMs,
+      correlationId: reqId !== undefined && reqId !== null ? String(reqId) : undefined,
+    });
+
     return {
       content: [
         {
@@ -289,6 +316,19 @@ export async function executeRunReadQuery(
       ],
     };
   } catch (error: any) {
+    if (parsedArgs?.connection_id) {
+      emitAuditEvent({
+        type: "agent_operation",
+        action: "run_read_query",
+        target: parsedArgs.connection_id,
+        user: callerId,
+        result: "failure",
+        reason: "agent_execution_failed",
+        duration: Date.now() - startTime,
+        correlationId: reqId !== undefined && reqId !== null ? String(reqId) : undefined,
+      });
+    }
+
     return {
       isError: true,
       content: [

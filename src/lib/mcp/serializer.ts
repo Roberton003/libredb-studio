@@ -1,6 +1,6 @@
 /**
- * Serializador seguro para o protocolo MCP.
- * Previne crashes em runtime causados por tipos nativos de banco de dados (BigInt, Buffers, Datas, ciclos).
+ * Safe serializer for the MCP protocol.
+ * Prevents runtime crashes caused by native database types (BigInt, Buffers, Dates, circular refs).
  */
 
 function serializeValue(value: unknown, seen = new WeakSet<object>()): unknown {
@@ -8,12 +8,12 @@ function serializeValue(value: unknown, seen = new WeakSet<object>()): unknown {
     return value;
   }
 
-  // Tratamento de BigInt (PostgreSQL int8, SQLite 64-bit int)
+  // Handle BigInt (PostgreSQL int8, SQLite 64-bit int)
   if (typeof value === "bigint") {
     return value.toString();
   }
 
-  // Tratamento de números não-finitos
+  // Handle non-finite numbers
   if (typeof value === "number") {
     if (Number.isNaN(value) || !Number.isFinite(value)) {
       return null;
@@ -25,22 +25,22 @@ function serializeValue(value: unknown, seen = new WeakSet<object>()): unknown {
     return value;
   }
 
-  // Tratamento de Datas (incluindo prevenção de crash com Invalid Date)
+  // Handle Dates (including crash prevention for Invalid Date)
   if (value instanceof Date) {
     return Number.isNaN(value.getTime()) ? null : value.toISOString();
   }
 
-  // Tratamento de Buffers e dados binários (BLOBs)
+  // Handle Buffers and binary data (BLOBs)
   if (Buffer.isBuffer(value) || value instanceof Uint8Array) {
     return `[Blob: ${value.length} bytes]`;
   }
 
-  // Tratamento de Erros
+  // Handle Errors
   if (value instanceof Error) {
     return { name: value.name, message: value.message };
   }
 
-  // Tratamento de Objetos e Arrays com prevenção de ciclos e getters hostis
+  // Handle Objects and Arrays with cycle prevention and hostile getters
   if (typeof value === "object") {
     if (seen.has(value)) {
       return "[Circular]";

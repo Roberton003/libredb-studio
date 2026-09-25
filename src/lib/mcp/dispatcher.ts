@@ -58,6 +58,7 @@ const MCP_TOOLS_DEFINITIONS: McpToolDefinition[] = [
         connection_id: { type: "string", description: "LibreDB Studio connection identifier." },
         sql: { type: "string", description: "Read-only SQL statement to execute." },
         max_rows: { type: "integer", minimum: 1, maximum: 500, default: 100 },
+        offset: { type: "integer", minimum: 0, default: 0 },
         timeout_ms: { type: "integer", minimum: 500, maximum: 30000, default: 10000 },
       },
     },
@@ -103,9 +104,29 @@ export class McpDispatcher {
       if (responses.length === 0) {
         return null;
       }
-      const maxBatchWireBytes = 64 * 1024 + 1024;
-      while (responses.length > 1 && Buffer.byteLength(JSON.stringify(responses)) > maxBatchWireBytes) {
-        responses.pop();
+      const maxBatchWireBytes = 64 * 1024;
+      let totalBytes = Buffer.byteLength(JSON.stringify(responses), "utf-8");
+      if (totalBytes > maxBatchWireBytes) {
+        logger.warn("MCP batch response wire budget exceeded, replacing overflow responses with per-id errors", {
+          totalBytes,
+          maxBatchWireBytes,
+          batchCount: responses.length,
+        });
+        for (let i = responses.length - 1; i >= 0; i--) {
+          if (totalBytes <= maxBatchWireBytes) {
+            break;
+          }
+          const prev = responses[i];
+          responses[i] = {
+            jsonrpc: "2.0",
+            id: prev.id,
+            error: {
+              code: JSON_RPC_ERRORS.INTERNAL_ERROR,
+              message: "Response exceeded the MCP batch output limit",
+            },
+          };
+          totalBytes = Buffer.byteLength(JSON.stringify(responses), "utf-8");
+        }
       }
       return responses;
     }
@@ -140,7 +161,7 @@ export class McpDispatcher {
       };
     }
 
-    // Se id foi fornecido (requisição RPC, não notificação), validar conformidade MCP
+    // If id is provided (RPC request, not notification), validate MCP conformance
     if (id !== undefined && !isValidId) {
       return {
         jsonrpc: "2.0",
@@ -152,7 +173,7 @@ export class McpDispatcher {
       };
     }
 
-    // Se params foi fornecido, deve ser um objeto ou array estruturado
+    // If params is provided, it must be a structured object or array
     if (params !== undefined && (typeof params !== "object" || params === null)) {
       return {
         jsonrpc: "2.0",
@@ -267,7 +288,10 @@ export class McpDispatcher {
         return executeListConnections(args, this.context);
 
       case "inspect_schema":
-        return executeInspectSchema(args, this.context);
+        return executeInspectSchema(args, this.context, {
+          requestId,
+          callerId: requestContext?.callerId,
+        });
 
       case "run_read_query":
         return executeRunReadQuery(args, this.context, {

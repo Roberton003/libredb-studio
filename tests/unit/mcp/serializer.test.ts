@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { safeJsonStringify, safeSerialize, redactErrorMessage, redactError } from "@/lib/mcp/serializer";
 
 describe("MCP Safe Serializer", () => {
-  test("serializa BigInt para string sem lançar TypeError", () => {
+  test("serializes BigInt to string without throwing TypeError", () => {
     const raw = {
       id: BigInt("9007199254740993"),
       normal: 42,
@@ -16,9 +16,9 @@ describe("MCP Safe Serializer", () => {
     expect(json).toContain('"id":"9007199254740993"');
   });
 
-  test("serializa Buffers e Uint8Array para identificador seguro de Blob", () => {
+  test("serializes Buffers and Uint8Array to safe Blob identifier", () => {
     const raw = {
-      avatar: Buffer.from("conteudo binario fake"),
+      avatar: Buffer.from("fake binary content"),
       binaryData: new Uint8Array([1, 2, 3, 4]),
     };
 
@@ -27,14 +27,14 @@ describe("MCP Safe Serializer", () => {
     expect(serialized.binaryData).toBe("[Blob: 4 bytes]");
   });
 
-  test("serializa Date para string ISO", () => {
+  test("serializes Date to ISO string", () => {
     const d = new Date("2026-09-20T21:00:00.000Z");
     const raw = { created_at: d };
     const serialized = safeSerialize(raw) as any;
     expect(serialized.created_at).toBe("2026-09-20T21:00:00.000Z");
   });
 
-  test("trata números não-finitos (NaN, Infinity)", () => {
+  test("handles non-finite numbers (NaN, Infinity)", () => {
     const raw = {
       valNan: Number.NaN,
       valInf: Number.POSITIVE_INFINITY,
@@ -44,8 +44,8 @@ describe("MCP Safe Serializer", () => {
     expect(serialized.valInf).toBeNull();
   });
 
-  test("previne estouro por referência circular", () => {
-    const obj: any = { name: "circulo" };
+  test("prevents overflow on circular references", () => {
+    const obj: any = { name: "circle" };
     obj.self = obj;
 
     const serialized = safeSerialize(obj);
@@ -53,19 +53,19 @@ describe("MCP Safe Serializer", () => {
     expect(() => safeJsonStringify(obj)).not.toThrow();
   });
 
-  test("trata Invalid Date retornando null sem lançar RangeError", () => {
-    const invalidDate = new Date("data-invalida-que-gera-nan");
+  test("handles Invalid Date by returning null without throwing RangeError", () => {
+    const invalidDate = new Date("invalid-date-generating-nan");
     const raw = { badDate: invalidDate };
     const serialized = safeSerialize(raw) as any;
     expect(serialized.badDate).toBeNull();
     expect(() => safeJsonStringify(raw)).not.toThrow();
   });
 
-  test("trata objetos com getters que lançam erro ou proxies hostis sem quebrar o serializador", () => {
+  test("handles objects with throwing getters or hostile proxies without breaking serializer", () => {
     const hostile: any = {};
     Object.defineProperty(hostile, "explosive", {
       get() {
-        throw new Error("Getters hostis interceptados");
+        throw new Error("Hostile getters intercepted");
       },
       enumerable: true,
     });
@@ -74,14 +74,14 @@ describe("MCP Safe Serializer", () => {
     expect(safeSerialize(hostile)).toBe("[object Object]");
   });
 
-  test("serializa Error para objeto com name e message", () => {
-    const err = new Error("Falha de teste");
+  test("serializes Error to object with name and message", () => {
+    const err = new Error("Test failure");
     const serialized = safeSerialize(err) as any;
     expect(serialized.name).toBe("Error");
-    expect(serialized.message).toBe("Falha de teste");
+    expect(serialized.message).toBe("Test failure");
   });
 
-  test("redactErrorMessage mascara senhas, tokens e credenciais em URIs", () => {
+  test("redactErrorMessage masks passwords, tokens, and credentials in URIs", () => {
     expect(redactErrorMessage("Failed to connect: password=test_password to host")).toBe(
       "Failed to connect: password=[REDACTED] to host",
     );
@@ -101,16 +101,25 @@ describe("MCP Safe Serializer", () => {
     expect(redactErrorMessage("")).toBe("Unknown error");
   });
 
-  test("redactErrorMessage é imune a ReDoS em strings com repetições longas de caracteres", () => {
-    const attackPayload = "A".repeat(50000);
-    const start = performance.now();
-    const result = redactErrorMessage(attackPayload);
-    const duration = performance.now() - start;
-    expect(result).toBe(attackPayload);
-    expect(duration).toBeLessThan(100);
+  test("redactErrorMessage is resilient against ReDoS on long repeating character strings with scheme and userinfo", () => {
+    const attackPayloadWithoutUserInfo = "http://" + "A".repeat(50000);
+    const attackPayloadWithUserInfo = "http://" + "A".repeat(50000) + "@host.internal/db";
+
+    const startWithout = performance.now();
+    const resultWithout = redactErrorMessage(attackPayloadWithoutUserInfo);
+    const durationWithout = performance.now() - startWithout;
+
+    const startWith = performance.now();
+    const resultWith = redactErrorMessage(attackPayloadWithUserInfo);
+    const durationWith = performance.now() - startWith;
+
+    expect(resultWithout).toBe(attackPayloadWithoutUserInfo);
+    expect(resultWith).toBe("http://[REDACTED]@host.internal/db");
+    expect(durationWithout).toBeLessThan(50);
+    expect(durationWith).toBeLessThan(50);
   });
 
-  test("redactError sanitiza message e stack de instâncias de Error", () => {
+  test("redactError sanitizes message and stack of Error instances", () => {
     const rawError = new Error("Database auth failure: password=test_password and token=test_token_value");
     rawError.name = "DatabaseAuthError";
 

@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { McpCancellationManager } from "@/lib/mcp/guards/cancellation";
 
 describe("McpCancellationManager", () => {
-  test("registra query e retorna AbortSignal ativo", () => {
+  test("registers query and returns active AbortSignal", () => {
     const manager = new McpCancellationManager();
     const signal = manager.register("user-1", "req-1", "conn-1");
 
@@ -10,7 +10,7 @@ describe("McpCancellationManager", () => {
     expect(signal.aborted).toBe(false);
   });
 
-  test("handleCancellation aciona abort e invoca cancelDatabaseOperation", async () => {
+  test("handleCancellation triggers abort and invokes cancelDatabaseOperation", async () => {
     const manager = new McpCancellationManager();
     let dbCancelCalled = false;
 
@@ -26,13 +26,13 @@ describe("McpCancellationManager", () => {
     expect(dbCancelCalled).toBe(true);
   });
 
-  test("handleCancellation retorna false para requestId inexistente", async () => {
+  test("handleCancellation returns false for non-existent requestId", async () => {
     const manager = new McpCancellationManager();
     const result = await manager.handleCancellation("user-1", "non-existent");
     expect(result).toBe(false);
   });
 
-  test("deregister remove query e chamadas subsequentes de cancelamento retornam false", async () => {
+  test("deregister removes query and subsequent cancellation calls return false", async () => {
     const manager = new McpCancellationManager();
     manager.register("user-1", "req-3", "conn-1");
     manager.deregister("user-1", "req-3");
@@ -41,7 +41,7 @@ describe("McpCancellationManager", () => {
     expect(result).toBe(false);
   });
 
-  test("isola cancelamento entre diferentes usuários (callerId isolation)", async () => {
+  test("isolates cancellation across different callers (callerId isolation)", async () => {
     const manager = new McpCancellationManager();
     let cancelACalled = false;
     let cancelBCalled = false;
@@ -58,23 +58,23 @@ describe("McpCancellationManager", () => {
     expect(s1.aborted).toBe(true);
     expect(cancelACalled).toBe(true);
 
-    // Beta permanece ativo e intocado
+    // Beta remains active and untouched
     expect(s2.aborted).toBe(false);
     expect(cancelBCalled).toBe(false);
 
-    // Cancelamento do Beta funciona independentemente
+    // Cancelling Beta works independently
     const handledB = await manager.handleCancellation("user-beta", "req-shared-id", "Beta aborted");
     expect(handledB).toBe(true);
     expect(s2.aborted).toBe(true);
     expect(cancelBCalled).toBe(true);
   });
 
-  test("previne colisão de chaves quando callerId ou requestId contêm delimitadores (ex: dois-pontos)", async () => {
+  test("prevents key collisions when callerId or requestId contain delimiters (e.g. colon)", async () => {
     const manager = new McpCancellationManager();
     let cancelACalled = false;
     let cancelBCalled = false;
 
-    // Cenário adversarial de colisão de strings:
+    // Adversarial string collision scenario:
     // User A: callerId="a", requestId="b:c"
     // User B: callerId="a:b", requestId="c"
     const s1 = manager.register("a", "b:c", "conn-1", async () => {
@@ -89,18 +89,18 @@ describe("McpCancellationManager", () => {
     expect(s1.aborted).toBe(true);
     expect(cancelACalled).toBe(true);
 
-    // B não deve ser cancelado pela colisão de prefixo com delimitador ':'
+    // B must not be cancelled due to prefix collision with ':' delimiter
     expect(s2.aborted).toBe(false);
     expect(cancelBCalled).toBe(false);
 
-    // Cancelar B funciona com sua própria chave exata
+    // Cancelling B works with its exact key
     const handledB = await manager.handleCancellation("a:b", "c", "Cancel B");
     expect(handledB).toBe(true);
     expect(s2.aborted).toBe(true);
     expect(cancelBCalled).toBe(true);
   });
 
-  test("abortAll cancela todas as queries ativas no shutdown", async () => {
+  test("abortAll cancels all active queries on shutdown", async () => {
     const manager = new McpCancellationManager();
     let cancelCount = 0;
 
@@ -118,7 +118,7 @@ describe("McpCancellationManager", () => {
     expect(cancelCount).toBe(2);
   });
 
-  test("executeRunReadQuery falha imediatamente (Fail-Fast) ao ser cancelada via McpCancellationManager", async () => {
+  test("executeRunReadQuery fails fast when cancelled via McpCancellationManager", async () => {
     const manager = new McpCancellationManager();
     let queryFinishedNormally = false;
 
@@ -126,7 +126,7 @@ describe("McpCancellationManager", () => {
       readOnlyProfile: true,
       prepareQuery: (sql: string, opts: any) => ({ query: sql, limit: opts.limit, offset: 0, wasLimited: false }),
       queryReadOnly: async () => {
-        // Simula query lenta em banco de dados assíncrono (500ms)
+        // Simulate slow query in asynchronous database (500ms)
         await new Promise((resolve) => setTimeout(resolve, 500));
         queryFinishedNormally = true;
         return { rows: [{ val: 1 }], fields: ["val"] };
@@ -146,10 +146,10 @@ describe("McpCancellationManager", () => {
       cancellationManager: manager,
     });
 
-    // Espera 10ms para garantir que a query iniciou e está pendente
+    // Wait 10ms to ensure query has started and is pending
     await new Promise((r) => setTimeout(r, 10));
 
-    // Cliente envia cancelamento usando o ID público da requisição e o mesmo callerId
+    // Client sends cancellation using public request ID and same callerId
     const cancelHandled = await manager.handleCancellation("user-test", "fast-cancel-req", "Client disconnected");
     expect(cancelHandled).toBe(true);
 
@@ -163,7 +163,7 @@ describe("McpCancellationManager", () => {
     expect(elapsed).toBeLessThan(100);
   });
 
-  test("deregister remove a chave primária e todos os aliases vinculados (zero orphan aliases)", async () => {
+  test("deregister removes primary key and all linked aliases (zero orphan aliases)", async () => {
     const manager = new McpCancellationManager();
     let cancelCalled = false;
     const signal = manager.register("user-1", "primary-id", "conn-1", async () => {
@@ -172,10 +172,10 @@ describe("McpCancellationManager", () => {
     manager.registerAlias("user-1", "alias-id-1", "primary-id");
     manager.registerAlias("user-1", "alias-id-2", "primary-id");
 
-    // Desregistra via chave primária
+    // Deregister via primary key
     manager.deregister("user-1", "primary-id");
 
-    // Tentativas de cancelamento subsequentes (seja pelo alias 1, alias 2 ou primário) devem retornar false
+    // Subsequent cancellation attempts (via alias 1, alias 2 or primary) must return false
     expect(await manager.handleCancellation("user-1", "alias-id-1")).toBe(false);
     expect(await manager.handleCancellation("user-1", "alias-id-2")).toBe(false);
     expect(await manager.handleCancellation("user-1", "primary-id")).toBe(false);
@@ -183,7 +183,7 @@ describe("McpCancellationManager", () => {
     expect(signal.aborted).toBe(false);
   });
 
-  test("handleCancellation via alias purga chave primária e outros aliases atomicamente", async () => {
+  test("handleCancellation via alias purges primary key and other aliases atomically", async () => {
     const manager = new McpCancellationManager();
     let cancelCount = 0;
     const signal = manager.register("user-1", "req-x", "conn-1", async () => {
@@ -191,13 +191,13 @@ describe("McpCancellationManager", () => {
     });
     manager.registerAlias("user-1", "req-x-alias", "req-x");
 
-    // Cancela através do alias
+    // Cancel through alias
     const handled = await manager.handleCancellation("user-1", "req-x-alias", "Client abort via alias");
     expect(handled).toBe(true);
     expect(signal.aborted).toBe(true);
     expect(cancelCount).toBe(1);
 
-    // Nova chamada via chave primária não deve reencontrar o handle nem reexecutar cancelDatabaseOperation
+    // New invocation via primary key must not find handle or re-execute cancelDatabaseOperation
     expect(await manager.handleCancellation("user-1", "req-x")).toBe(false);
     expect(await manager.handleCancellation("user-1", "req-x-alias")).toBe(false);
     expect(cancelCount).toBe(1);
