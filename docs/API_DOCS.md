@@ -1547,6 +1547,30 @@ The answers, in the order they are checked:
 After the same Origin, Host, bearer, switch and version checks, 405 with the SDK's JSON-RPC body and `Allow: POST`: the server keeps no session and offers no stream.
 Neither is metered.
 
+#### `GET /api/mcp/token`
+
+The MCP channel's status for the signed-in user, which the settings screen reads; session-checked and never metered.
+
+```text
+{ "state": "off" | "misconfigured" | "ready", "problems": [ "..." ], "url": "https://studio.example.com/api/mcp" | null, "tokenTtlDays": 30 | null, "visibleConnections": 2 | null }
+```
+
+Each problem names one variable and its fix, never the configured value.
+`visibleConnections` is how many `mcp: true` seed connections your role reaches, and `null`, with a problem, when the seed file cannot be read.
+It never returns a token.
+
+#### `POST /api/mcp/token`
+
+Mints a token for the signed-in user and role; it reads no body field and spends one slot of the query budget.
+
+| Status | Body |
+|---|---|
+| 200 | `{ "token": "...", "expiresAt": "<ISO 8601>", "url": "..." }` with `Cache-Control: no-store`; the token appears in no other response |
+| 401 | `{ "error": "Authentication required" }` |
+| 409 | `{ "error": "MCP tokens cannot be issued on this server", "problems": [ "..." ] }` |
+| 429 | The rate-limit body of [Error Handling](#error-handling), with `Retry-After` |
+| 500 | `{ "error": "The token was not issued because its audit record could not be written." }` |
+
 ---
 
 ### Storage API

@@ -156,6 +156,22 @@ describe("through proxy(), the rest of the application", () => {
     request.headers.set(AGENT_DRIVE_HEADER, await mintTestToken());
     expect((await proxy(request)).status).toBe(307);
   });
+
+  test("refuses a cross-origin POST to the minting endpoint with checkOrigin's 403", async () => {
+    const cookie = await signJWT({ username: "alice", role: "admin" });
+    const request = new NextRequest("http://localhost:3000/api/mcp/token", {
+      method: "POST",
+      headers: {
+        host: "localhost:3000",
+        origin: "https://evil.example",
+        cookie: `auth-token=${cookie}`,
+        "content-type": "application/json",
+      },
+    });
+    const response = await proxy(request);
+    expect(response.status).toBe(403);
+    expect(((await response.json()) as { code: string }).code).toBe("ORIGIN_MISMATCH");
+  });
 });
 
 describe("through proxy(), a refusal on /api/mcp is audited", () => {
