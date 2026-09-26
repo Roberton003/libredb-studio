@@ -40,6 +40,7 @@ LIBREDB_MCP_ENABLED=true LIBREDB_MCP_TOKEN_LABEL=studio-mcp-1 npx @libredb/studi
 
 The derived address is `http://127.0.0.1:3000/api/mcp` unless `--host` or `--port` says otherwise, and changing either invalidates every token minted for the old address.
 Set `LIBREDB_MCP_URL` yourself when clients reach Studio through another address, such as a reverse proxy.
+The launcher resolves a relative path variable, such as `SEED_CONFIG_PATH`, against the directory you run `npx` from, so `SEED_CONFIG_PATH=./seed-connections.yaml` finds the file beside you.
 
 ### Docker and Compose
 
@@ -47,12 +48,14 @@ Add the three settings to the container's environment:
 
 ```bash
 docker run -p 3000:3000 \
+  -v libredb-data:/app/data \
   -e LIBREDB_MCP_ENABLED=true \
   -e LIBREDB_MCP_URL=https://studio.example.com/api/mcp \
   -e LIBREDB_MCP_TOKEN_LABEL=studio-mcp-1 \
   ghcr.io/libredb/libredb-studio:latest
 ```
 
+The `libredb-data` volume keeps `/app/data`, where Studio stores the admin credentials and the `JWT_SECRET` it generates when you set none, so every MCP token survives the container being recreated; without it, a new container generates a new `JWT_SECRET` and every MCP token stops verifying.
 In `docker-compose.example.yml`, uncomment the four `LIBREDB_MCP_*` lines beside the agent flag.
 
 ### Helm
@@ -86,6 +89,7 @@ connections:
 ```
 
 The opt-in is per connection, so `defaults.mcp` is refused.
+A SQLite seed's `database` is an absolute path on the machine running Studio, and under Docker a path inside the container, so mount the file there.
 The built-in sample connections are never visible to an MCP client.
 An empty `list_connections` answer means no connection is opted in for your token's role: an operator adds `mcp: true` to a seed connection.
 
@@ -96,7 +100,10 @@ A seed entry cannot carry a separate agent credential, so the fix is the seed's 
 
 ## Getting a token
 
-Open **MCP** in the user menu, the settings screen at `/settings/mcp`.
+On a first start without `ADMIN_PASSWORD`, Studio generates an admin, `admin@libredb.org`, with a random password and prints both once: under npx in the terminal, under Docker in `docker logs`.
+It also stores the password in `auth-bootstrap.json` in its data directory, the directory of `STORAGE_SQLITE_PATH` (`/app/data` in the image), and a later start prints only that file's path.
+An admin signs in to the admin dashboard, which has no user menu: choose **Editor**, then the user menu at the top right, then **MCP**.
+That opens the settings screen at `/settings/mcp`.
 It shows whether MCP is ready on this server, what an operator has to set when it is not, and how many connections your role can reach.
 When it is ready, **Create token** mints one for you and shows it once: copy it then, because it is not shown again and nothing about it is stored.
 

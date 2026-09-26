@@ -101,6 +101,30 @@ describe("docs/MCP.md", () => {
     expect(MCP_DOC).toContain("A seed entry cannot carry a separate agent credential");
   });
 
+  test("says npx resolves a relative path variable against the directory it is run from", () => {
+    expect(MCP_DOC).toContain(
+      "The launcher resolves a relative path variable, such as `SEED_CONFIG_PATH`, against the directory you run `npx` from",
+    );
+  });
+
+  test("mounts a volume on /app/data in the Docker example and says what dies without it", () => {
+    expect(MCP_DOC).toContain("  -v libredb-data:/app/data \\\n");
+    expect(MCP_DOC).toContain(
+      "without it, a new container generates a new `JWT_SECRET` and every MCP token stops verifying",
+    );
+  });
+
+  test("says where a first start's admin credentials are shown and stored, and how an admin reaches the MCP screen", () => {
+    expect(MCP_DOC).toContain("`admin@libredb.org`");
+    expect(MCP_DOC).toContain("under npx in the terminal, under Docker in `docker logs`");
+    expect(MCP_DOC).toContain("`auth-bootstrap.json`");
+    expect(MCP_DOC).toContain("choose **Editor**, then the user menu at the top right, then **MCP**");
+  });
+
+  test("says a SQLite seed's database is a path on the machine running Studio", () => {
+    expect(MCP_DOC).toContain("A SQLite seed's `database` is an absolute path on the machine running Studio");
+  });
+
   test("says a static Authorization header is required, because phase 1 serves no OAuth metadata", () => {
     expect(MCP_DOC).toContain("a client needs its `Authorization` header configured");
   });
