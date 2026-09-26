@@ -918,6 +918,31 @@ function isReadOnlyWriteError(error: unknown): boolean {
   return error instanceof Error && error.message.includes("attempt to write a readonly database");
 }
 
+/**
+ * True when the file's header says WAL journal mode: bytes 18 and 19, the file format
+ * write and read versions, are 2 in WAL mode and 1 under a rollback journal
+ * (https://www.sqlite.org/fileformat2.html#file_format_version_numbers). SQLite's own
+ * words for a refused WAL file differ by build (SQLITE_READONLY from the library bundled
+ * on Linux, SQLITE_CANTOPEN from Apple's, or with a `-wal` left and no `-shm`), so the
+ * header is what says the refusal is about WAL. It is read only to explain a refusal
+ * already raised: a file this process cannot read answers false, and that refusal keeps
+ * SQLite's words alone.
+ */
+function isWalModeFile(dbPath: string): boolean {
+  let fd: number;
+  try {
+    fd = fs.openSync(dbPath, "r");
+  } catch {
+    return false;
+  }
+  try {
+    const header = Buffer.alloc(20);
+    return fs.readSync(fd, header, 0, 20, 0) === 20 && header[18] === 2 && header[19] === 2;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 // ============================================================================
 // Agent read-only execution profile (#328)
 // ============================================================================
@@ -1203,7 +1228,7 @@ export class SQLiteProvider extends SQLBaseProvider {
       const reason = error instanceof Error ? error.message : String(error);
       // The one read-only open SQLite refuses outright: see `connectUnwritableFile`.
       const walHint =
-        this.unwritableFilePath !== null && isReadOnlyWriteError(error)
+        this.unwritableFilePath !== null && isWalModeFile(this.unwritableFilePath)
           ? `${this.unwritableFilePath} is open read-only because this process cannot write the file or its directory, and a file in WAL journal mode cannot be read without a -shm file beside it; switch it to a rollback journal (PRAGMA journal_mode = DELETE) where it is writable, or make its directory writable: `
           : "";
       throw new ConnectionError(`Failed to open SQLite database: ${walHint}${reason}`, "sqlite");
@@ -1225,7 +1250,8 @@ export class SQLiteProvider extends SQLBaseProvider {
    * A file already in WAL journal mode, with no `-shm` file beside it, still cannot be
    * opened when its directory is unwritable: SQLite reads one only with a `-shm` file
    * beside it, and has nowhere to make one (measured on bun:sqlite and node:sqlite,
-   * 2026-09-26). `connect()` names that case.
+   * 2026-09-26). `connect()` names that case, reading it from the file's header because
+   * SQLite words it differently by build (`isWalModeFile`).
    */
   private connectUnwritableFile(SQLiteDB: Awaited<ReturnType<typeof loadSQLiteDriver>>, dbPath: string): void {
     this.unwritableFilePath = dbPath;

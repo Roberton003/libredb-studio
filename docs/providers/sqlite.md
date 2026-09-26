@@ -353,6 +353,9 @@ A write is refused by SQLite itself, and `query()` raises it as a `QueryError` t
 A file already in WAL journal mode, with no `-shm` file beside it, still cannot be opened when its directory is unwritable: SQLite reads one only with a `-shm` file beside it, and has nowhere to make one (measured on `bun:sqlite` and `node:sqlite`, 2026-09-26).
 That includes any file this editor has written, because §3.2 leaves the file in WAL mode.
 `connect()` then fails with a `ConnectionError` that says so and names the two ways out: run `PRAGMA journal_mode = DELETE` on the file where it is writable, or make its directory writable.
+SQLite's own words for that refusal differ by build: the library bundled on Linux answers the file alone with "attempt to write a readonly database", Apple's libsqlite3 on macOS answers "unable to open database file", and so does Linux when a `-wal` is left beside the file with no `-shm` (measured on the macos-latest runner and on Linux, 2026-09-26).
+So the reason is not read from those words but from the file's header, where bytes 18 and 19 are 2 in WAL mode, and SQLite's words follow it.
+A file this process cannot even read gets SQLite's words alone.
 
 Both drivers take the same path.
 The tests use a real file with mode 0444 in a directory with mode 0555, and are skipped as root, where modes restrict nothing, and on Windows, which enforces no directory mode; the Linux CI job runs as an ordinary user and covers them.

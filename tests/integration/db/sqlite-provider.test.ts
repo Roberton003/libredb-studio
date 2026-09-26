@@ -9,7 +9,7 @@
 
 import { describe, test, expect, afterEach, beforeAll, afterAll, spyOn } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { Database as BunDatabase } from "bun:sqlite";
+import { Database as BunDatabase, constants as sqliteConstants } from "bun:sqlite";
 import {
   chmodSync,
   existsSync,
@@ -4499,22 +4499,26 @@ const MISSING_UNWRITABLE_FILE: string | null =
  * the provider leaves a file in WAL mode, and that is its own fixture (see "a WAL-mode file"
  * below).
  *
- * A WAL fixture is the file alone, with no `-wal` or `-shm` beside it. Closing removes both
- * on Linux and Windows but not on macOS, where bun:sqlite links Apple's libsqlite3, which
- * keeps them (docs/providers/sqlite.md §3.2); with them left in place the read-only open
- * succeeded on the macos-latest runner (2026-09-26). So the checkpoint moves every row into
- * the file, and the sidecars go by hand.
+ * A WAL fixture is the file alone, with no `-wal` or `-shm` beside it, unless `keepWal`
+ * leaves its `-wal`. Closing removes both on Linux and Windows but not on macOS, where
+ * bun:sqlite links Apple's libsqlite3, which keeps them (docs/providers/sqlite.md §3.2);
+ * with them left in place the read-only open succeeded on the macos-latest runner
+ * (2026-09-26). So the checkpoint moves every row into the file, `PERSIST_WAL` makes every
+ * platform keep the `-wal` alike, and what is not kept goes by hand.
  */
-function writeUnwritableFixture(dir: string, journalMode: "delete" | "wal"): string {
+function writeUnwritableFixture(dir: string, journalMode: "delete" | "wal", keepWal = false): string {
   mkdirSync(dir, { recursive: true });
   const file = join(dir, "shop.db");
   const db = new BunDatabase(file, { create: true, readwrite: true });
   db.exec(`PRAGMA journal_mode = ${journalMode}`);
   db.exec("CREATE TABLE orders (id INTEGER PRIMARY KEY, customer TEXT NOT NULL, total REAL)");
   db.exec("INSERT INTO orders VALUES (1, 'ada', 10.5), (2, 'bob', 20), (3, 'cy', 30.25)");
-  if (journalMode === "wal") db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+  if (journalMode === "wal") {
+    db.fileControl(sqliteConstants.SQLITE_FCNTL_PERSIST_WAL, 1);
+    db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+  }
   db.close(true);
-  rmSync(`${file}-wal`, { force: true });
+  if (!keepWal) rmSync(`${file}-wal`, { force: true });
   rmSync(`${file}-shm`, { force: true });
   chmodSync(file, 0o444);
   chmodSync(dir, 0o555);
@@ -4557,6 +4561,10 @@ function runNodeHarness(dbPath: string, scenario: string): Record<string, unknow
     rmSync(bundleDir, { recursive: true, force: true });
   }
 }
+
+/** The reason a refused WAL-mode file is given, before SQLite's own words. */
+const WAL_REFUSAL = (file: string) =>
+  `Failed to open SQLite database: ${file} is open read-only because this process cannot write the file or its directory, and a file in WAL journal mode cannot be read without a -shm file beside it; switch it to a rollback journal (PRAGMA journal_mode = DELETE) where it is writable, or make its directory writable: `;
 
 const READ_ONLY_INSERT_MESSAGE = (file: string) =>
   `SQLite database ${file} is open read-only because this process cannot write the file or its directory: attempt to write a readonly database`;
@@ -4639,15 +4647,45 @@ describe("SQLiteProvider on a database file this process cannot write", () => {
     // SQLite reads a WAL-mode file only with a `-shm` file beside it, and a directory it
     // cannot write gives it nowhere to make one, so even a read-only handle is refused
     // (measured on bun:sqlite and node:sqlite, 2026-09-26). The provider cannot change
-    // that, but it can say why instead of passing on "attempt to write a readonly database".
+    // that, but it can say why instead of passing on SQLite's bare refusal. SQLite words
+    // that refusal two ways: Linux's bundled library answers the file alone with
+    // SQLITE_READONLY, and Apple's with SQLITE_CANTOPEN (macos-latest, 2026-09-26). So the
+    // reason is read from the file's header, and SQLite's own words follow it.
     test("a WAL-mode file is refused with the reason and the way out", async () => {
       const file = writeUnwritableFixture(join(root, "wal"), "wal");
       const db = new SQLiteProvider(makeSQLiteConfig({ database: file }));
       const connect = db.connect();
       await expect(connect).rejects.toBeInstanceOf(ConnectionError);
       await expect(connect).rejects.toThrow(
-        `Failed to open SQLite database: ${file} is open read-only because this process cannot write the file or its directory, and a file in WAL journal mode cannot be read without a -shm file beside it; switch it to a rollback journal (PRAGMA journal_mode = DELETE) where it is writable, or make its directory writable: attempt to write a readonly database`,
+        WAL_REFUSAL(file) +
+          (process.platform === "darwin" ? "unable to open database file" : "attempt to write a readonly database"),
       );
+      expect(db.isConnected()).toBe(false);
+    });
+
+    // A `-wal` left beside the file with no `-shm` is SQLITE_CANTOPEN on Linux too.
+    test("a WAL-mode file with its -wal left and no -shm is refused with the same reason", async () => {
+      const dir = join(root, "wal-left");
+      const file = writeUnwritableFixture(dir, "wal", true);
+      expect(readdirSync(dir).sort()).toEqual(["shop.db", "shop.db-wal"]);
+      const db = new SQLiteProvider(makeSQLiteConfig({ database: file }));
+      const connect = db.connect();
+      await expect(connect).rejects.toBeInstanceOf(ConnectionError);
+      await expect(connect).rejects.toThrow(`${WAL_REFUSAL(file)}unable to open database file`);
+      expect(db.isConnected()).toBe(false);
+    });
+
+    // The control: a refusal that has nothing to do with WAL keeps SQLite's words alone.
+    test("a file this process cannot read is refused without the WAL reason", async () => {
+      const dir = join(root, "unreadable");
+      const file = writeUnwritableFixture(dir, "delete");
+      chmodSync(dir, 0o755);
+      chmodSync(file, 0o000);
+      chmodSync(dir, 0o555);
+      const db = new SQLiteProvider(makeSQLiteConfig({ database: file }));
+      const connect = db.connect();
+      await expect(connect).rejects.toBeInstanceOf(ConnectionError);
+      await expect(connect).rejects.toThrow(/^Failed to open SQLite database: unable to open database file$/);
       expect(db.isConnected()).toBe(false);
     });
 
