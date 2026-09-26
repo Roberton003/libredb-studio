@@ -1,6 +1,6 @@
 /**
  * How each MCP client is pointed at this server (#246), one snippet per client in the keys its own
- * documentation gives: Claude Code, Codex, Cursor, VS Code and Gemini CLI. The settings screen
+ * documentation gives: Claude Code, Codex, Cursor, VS Code, Gemini CLI and OpenCode. The settings screen
  * renders these for the deployment's canonical URL, and docs/MCP.md repeats them for an example
  * URL under a guard, so the two cannot drift.
  *
@@ -14,11 +14,18 @@ export const MCP_TOKEN_ENV_NAME = "LIBREDB_MCP_TOKEN";
 export const MCP_TOKEN_PLACEHOLDER = "<your-mcp-token>";
 export const MCP_VSCODE_INPUT_ID = "libredb-mcp-token";
 
-export type McpClientConfigId = "claude-code-json" | "claude-code-cli" | "codex" | "cursor" | "vscode" | "gemini-cli";
+export type McpClientConfigId =
+  | "claude-code-json"
+  | "claude-code-cli"
+  | "codex"
+  | "cursor"
+  | "vscode"
+  | "gemini-cli"
+  | "opencode";
 
 export interface McpClientConfig {
   readonly id: McpClientConfigId;
-  readonly client: "Claude Code" | "Codex" | "Cursor" | "VS Code" | "Gemini CLI";
+  readonly client: "Claude Code" | "Codex" | "Cursor" | "VS Code" | "Gemini CLI" | "OpenCode";
   readonly file: string;
   readonly language: "json" | "toml" | "bash";
   readonly snippet: string;
@@ -81,6 +88,25 @@ export function mcpClientConfigs(url: string): readonly McpClientConfig[] {
       language: "json",
       snippet: json({
         mcpServers: { libredb: { httpUrl: url, headers: { Authorization: `Bearer ${MCP_TOKEN_PLACEHOLDER}` } } },
+      }),
+    },
+    {
+      id: "opencode",
+      client: "OpenCode",
+      file: "opencode.json",
+      language: "json",
+      // oauth: false stops the OAuth sign-in OpenCode would otherwise attempt against a remote server.
+      snippet: json({
+        $schema: "https://opencode.ai/config.json",
+        mcp: {
+          libredb: {
+            type: "remote",
+            url,
+            enabled: true,
+            oauth: false,
+            headers: { Authorization: `Bearer {env:${MCP_TOKEN_ENV_NAME}}` },
+          },
+        },
       }),
     },
   ];

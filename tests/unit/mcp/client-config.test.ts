@@ -16,7 +16,7 @@ const configs = mcpClientConfigs(URL);
 const snippet = (id: string) => configs.find((config) => config.id === id)?.snippet ?? "";
 
 describe("the snippets", () => {
-  test("cover five clients in the order the screen shows them", () => {
+  test("cover six clients in the order the screen shows them", () => {
     expect(configs.map((config) => [config.id, config.client, config.language])).toEqual([
       ["claude-code-json", "Claude Code", "json"],
       ["claude-code-cli", "Claude Code", "bash"],
@@ -24,6 +24,7 @@ describe("the snippets", () => {
       ["cursor", "Cursor", "json"],
       ["vscode", "VS Code", "json"],
       ["gemini-cli", "Gemini CLI", "json"],
+      ["opencode", "OpenCode", "json"],
     ]);
   });
 
@@ -61,6 +62,22 @@ describe("the snippets", () => {
       mcpServers: { libredb: { httpUrl: URL, headers: { Authorization: "Bearer <your-mcp-token>" } } },
     });
     expect(parsed.mcpServers.libredb).not.toHaveProperty("url");
+  });
+
+  test("OpenCode takes a remote server with OAuth off and a header expanded from {env:LIBREDB_MCP_TOKEN}", () => {
+    expect(configs.find((config) => config.id === "opencode")?.file).toBe("opencode.json");
+    expect(JSON.parse(snippet("opencode"))).toEqual({
+      $schema: "https://opencode.ai/config.json",
+      mcp: {
+        libredb: {
+          type: "remote",
+          url: URL,
+          enabled: true,
+          oauth: false,
+          headers: { Authorization: "Bearer {env:LIBREDB_MCP_TOKEN}" },
+        },
+      },
+    });
   });
 
   test("no snippet carries a token in a URL or anything shaped like a JWT", () => {

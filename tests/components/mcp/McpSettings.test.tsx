@@ -168,4 +168,14 @@ describe("the client configuration", () => {
       expect(getByTestId(`mcp-snippet-${config.id}`).textContent).toBe(config.snippet);
     }
   });
+
+  test("shows OpenCode's opencode.json snippet with its heading and file", async () => {
+    serve(READY);
+    const { findByTestId } = render(<McpSettings />);
+    const snippet = await findByTestId("mcp-snippet-opencode");
+    expect(JSON.parse(snippet.textContent ?? "")).toMatchObject({ mcp: { libredb: { type: "remote", url: URL } } });
+    const article = snippet.closest("article");
+    expect(article?.querySelector("h3")?.textContent).toBe("OpenCode");
+    expect(article?.textContent).toContain("In opencode.json:");
+  });
 });

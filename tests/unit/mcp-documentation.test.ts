@@ -14,7 +14,7 @@ const read = (relative: string): string => readFileSync(path.join(ROOT, relative
 const MCP_DOC = read("docs/MCP.md");
 const API_DOCS = read("docs/API_DOCS.md");
 const DOC_URL = "https://studio.example.com/api/mcp";
-const CLIENTS = ["Claude Code", "Codex", "Cursor", "VS Code", "Gemini CLI"];
+const CLIENTS = ["Claude Code", "Codex", "Cursor", "VS Code", "Gemini CLI", "OpenCode"];
 
 describe("docs/API_DOCS.md documents every MCP route", () => {
   const routes = [...new Bun.Glob("src/app/api/mcp/**/route.ts").scanSync(ROOT)]
@@ -44,6 +44,10 @@ describe("docs/MCP.md", () => {
     expect(MCP_DOC).toContain(
       `Runs on ${RUN_READ_QUERY_ENGINES}; other engines refuse it, so use inspect_schema there.`,
     );
+  });
+
+  test("the snippet guard covers the OpenCode section", () => {
+    expect(mcpClientConfigs(DOC_URL).map((config) => config.client)).toContain("OpenCode");
   });
 
   test.each(mcpClientConfigs(DOC_URL).map((config) => [config.id, config] as const))(
