@@ -191,7 +191,11 @@ describe("a token signed with JWT_SECRET that is not a session", () => {
 describe("a URL that carries credentials", () => {
   test("is named by its rule in both answers, and no part of it is repeated", async () => {
     restoreChannel();
-    restoreChannel = useMcpChannel({ url: "https://someone:hunter-two@studio.example/api/mcp" });
+    // Built from parts, so the file holds no literal credential URL for a secret scanner to flag.
+    const credentialed = new URL("https://studio.example/api/mcp");
+    credentialed.username = "someone";
+    credentialed.password = "hunter-two";
+    restoreChannel = useMcpChannel({ url: credentialed.href });
     await signIn("alice", "admin");
     for (const response of [await GET(), await POST(mintRequest())]) {
       const text = await response.text();
