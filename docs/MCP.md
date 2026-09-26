@@ -122,7 +122,7 @@ Never commit a token.
 
 ### Claude Code
 
-Not verified live.
+Verified live on 2026-09-26 with Claude Code 2.1.283.
 
 In `.mcp.json`:
 
@@ -230,6 +230,31 @@ In `~/.gemini/settings.json`; Gemini CLI takes the streaming HTTP address as `ht
 
 Or run `gemini mcp add -t http -H "Authorization: Bearer <your-mcp-token>" libredb https://studio.example.com/api/mcp`.
 Do not commit a settings file that holds a token.
+
+### OpenCode
+
+Verified live on 2026-09-26 with OpenCode 1.18.31.
+
+In `opencode.json`, as a remote server ([OpenCode's MCP servers page](https://opencode.ai/docs/mcp-servers)); `oauth: false` turns off the OAuth sign-in OpenCode would otherwise attempt, and `{env:...}` reads the token from the environment:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "libredb": {
+      "type": "remote",
+      "url": "https://studio.example.com/api/mcp",
+      "enabled": true,
+      "oauth": false,
+      "headers": {
+        "Authorization": "Bearer {env:LIBREDB_MCP_TOKEN}"
+      }
+    }
+  }
+}
+```
+
+`opencode mcp list` shows the server as connected when the token verifies.
 
 ## Limits
 
