@@ -64,17 +64,20 @@ describe("the snippets", () => {
     expect(parsed.mcpServers.libredb).not.toHaveProperty("url");
   });
 
-  test("OpenCode takes a remote server with OAuth off and a header expanded from {env:LIBREDB_MCP_TOKEN}", () => {
+  // Under mcp.servers, the shape OpenCode 2 documents, which OpenCode 1 reads as well; no
+  // `enabled`, which OpenCode 2 replaced with `disabled` (docs/MCP.md, OpenCode).
+  test("OpenCode takes a remote server under mcp.servers with OAuth off and a header from {env:LIBREDB_MCP_TOKEN}", () => {
     expect(configs.find((config) => config.id === "opencode")?.file).toBe("opencode.json");
     expect(JSON.parse(snippet("opencode"))).toEqual({
       $schema: "https://opencode.ai/config.json",
       mcp: {
-        libredb: {
-          type: "remote",
-          url: URL,
-          enabled: true,
-          oauth: false,
-          headers: { Authorization: "Bearer {env:LIBREDB_MCP_TOKEN}" },
+        servers: {
+          libredb: {
+            type: "remote",
+            url: URL,
+            oauth: false,
+            headers: { Authorization: "Bearer {env:LIBREDB_MCP_TOKEN}" },
+          },
         },
       },
     });

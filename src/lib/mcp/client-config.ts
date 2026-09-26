@@ -96,15 +96,17 @@ export function mcpClientConfigs(url: string): readonly McpClientConfig[] {
       file: "opencode.json",
       language: "json",
       // oauth: false stops the OAuth sign-in OpenCode would otherwise attempt against a remote server.
+      // mcp.servers is where OpenCode 2 looks for servers, and OpenCode 1 reads it too.
       snippet: json({
         $schema: "https://opencode.ai/config.json",
         mcp: {
-          libredb: {
-            type: "remote",
-            url,
-            enabled: true,
-            oauth: false,
-            headers: { Authorization: `Bearer {env:${MCP_TOKEN_ENV_NAME}}` },
+          servers: {
+            libredb: {
+              type: "remote",
+              url,
+              oauth: false,
+              headers: { Authorization: `Bearer {env:${MCP_TOKEN_ENV_NAME}}` },
+            },
           },
         },
       }),

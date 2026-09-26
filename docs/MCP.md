@@ -240,21 +240,22 @@ Do not commit a settings file that holds a token.
 
 ### OpenCode
 
-Verified live on 2026-09-26 with OpenCode 1.18.31.
+Verified live on 2026-09-26 with OpenCode 1.18.31, 1.18.32 and 2.0.18, on Linux and Windows.
 
-In `opencode.json`, as a remote server ([OpenCode's MCP servers page](https://opencode.ai/docs/mcp-servers)); `oauth: false` turns off the OAuth sign-in OpenCode would otherwise attempt, and `{env:...}` reads the token from the environment:
+In `opencode.json`, as a remote server under `mcp.servers`, where OpenCode 2 looks for servers and OpenCode 1 reads them too ([OpenCode's MCP servers page](https://opencode.ai/docs/mcp-servers), and [the OpenCode 2 page](https://opencode.ai/v2/docs/mcp-servers)); `oauth: false` turns off the OAuth sign-in OpenCode would otherwise attempt, and `{env:...}` reads the token from the environment:
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
   "mcp": {
-    "libredb": {
-      "type": "remote",
-      "url": "https://studio.example.com/api/mcp",
-      "enabled": true,
-      "oauth": false,
-      "headers": {
-        "Authorization": "Bearer {env:LIBREDB_MCP_TOKEN}"
+    "servers": {
+      "libredb": {
+        "type": "remote",
+        "url": "https://studio.example.com/api/mcp",
+        "oauth": false,
+        "headers": {
+          "Authorization": "Bearer {env:LIBREDB_MCP_TOKEN}"
+        }
       }
     }
   }
@@ -262,6 +263,8 @@ In `opencode.json`, as a remote server ([OpenCode's MCP servers page](https://op
 ```
 
 `opencode mcp list` shows the server as connected when the token verifies.
+OpenCode 2 runs one shared background service that reads `LIBREDB_MCP_TOKEN` when it starts, so set the token before the first `opencode` command, or run `opencode service restart` after setting it.
+For the first few seconds after that service starts, `opencode mcp list` can say "No MCP servers configured" or show the server as pending: run it again.
 
 ## Limits
 
