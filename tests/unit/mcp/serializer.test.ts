@@ -34,6 +34,14 @@ describe("MCP Safe Serializer", () => {
     expect(serialized.created_at).toBe("2026-09-20T21:00:00.000Z");
   });
 
+  test("keeps null and undefined as they are, at the top level and inside an object", () => {
+    expect(safeSerialize(null)).toBeNull();
+    expect(safeSerialize(undefined)).toBeUndefined();
+    const serialized = safeSerialize({ empty: null, missing: undefined });
+    expect(serialized).toEqual({ empty: null, missing: undefined });
+    expect(Object.hasOwn(serialized, "missing")).toBe(true);
+  });
+
   test("handles non-finite numbers (NaN, Infinity)", () => {
     const raw = {
       valNan: Number.NaN,
