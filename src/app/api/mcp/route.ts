@@ -5,7 +5,7 @@ import { logger } from "@/lib/logger";
 import { auditMcpDenial, authenticateMcpRequest } from "@/lib/mcp/bearer";
 import { MCP_ENABLED_INVALID_MESSAGE, MCP_PATH, readMcpSwitch } from "@/lib/mcp/config";
 import { mcpOriginHostRefusal } from "@/lib/mcp/origin-policy";
-import { preprocessMcpPost } from "@/lib/mcp/preprocess";
+import { preprocessMcpPost, recordInvalidArguments } from "@/lib/mcp/preprocess";
 import { mcpHandler } from "@/lib/mcp/server";
 
 export const dynamic = "force-dynamic";
@@ -58,7 +58,13 @@ export async function POST(request: Request): Promise<Response> {
   if ("response" in admission) return admission.response;
   const outcome = await preprocessMcpPost(request, admission.authInfo);
   if (outcome.kind === "refused") return outcome.response;
-  return mcpHandler.fetch(request, { authInfo: admission.authInfo, parsedBody: outcome.parsedBody });
+  const response = await mcpHandler.fetch(request, { authInfo: admission.authInfo, parsedBody: outcome.parsedBody });
+  // HTTP 200 means the SDK accepted the call and answered its own input validation error; any other
+  // status is an earlier SDK gate's refusal, and no call was made to record.
+  if (outcome.invalidArgumentsTool !== null && response.status === 200) {
+    recordInvalidArguments(outcome.invalidArgumentsTool, admission.authInfo);
+  }
+  return response;
 }
 
 /**
