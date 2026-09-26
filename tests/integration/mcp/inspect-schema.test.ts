@@ -5,14 +5,16 @@
  * through every level an engine declares, and the decision recorded before anything is acquired.
  *
  * No provider fills a table comment today, so the comment cases patch the real SQLite provider's
- * listObjects to add one, and restore it.
+ * listObjects to add one, and restore it. The MongoDB case runs the real provider over a stubbed
+ * client, because it is the engine that declares no "table" kind and no server runs here.
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { open, table } from "@libredb/libredb";
+import { doc, open, table } from "@libredb/libredb";
 import { getServerAuditBuffer } from "@/lib/audit";
+import { MongoDBProvider } from "@/lib/db/providers/document/mongodb";
 import { SQLiteProvider } from "@/lib/db/providers/sql/sqlite";
 import { logger } from "@/lib/logger";
 import { McpConnectionContext } from "@/lib/mcp/context";
@@ -70,6 +72,9 @@ beforeAll(async () => {
     name: "Ada",
   });
   libredb.close();
+  const documents = open({ path: join(dir, "documents.libredb") });
+  doc(documents, "articles").put("a1", { title: "Hello", body: "world" });
+  documents.close();
 });
 
 beforeEach(() => {
@@ -81,6 +86,7 @@ beforeEach(() => {
     { id: "warehouse", type: "duckdb", database: join(dir, "warehouse.duckdb") },
     { id: "memory", type: "sqlite", database: ":memory:" },
     { id: "notes", type: "libredb", database: join(dir, "notes.libredb") },
+    { id: "documents", type: "libredb", database: join(dir, "documents.libredb") },
   ]);
 });
 
@@ -179,6 +185,67 @@ describe("the answer", () => {
     expect(result.isError ?? false).toBe(false);
     // LibreDB names a cataloged table by the key-prefix group it owns (src/lib/db/providers/embedded/libredb.ts).
     expect(result.structuredContent?.tables.map((entry: { name: string }) => entry.name)).toContain("employees:*");
+  });
+
+  test("lists a LibreDB store that holds only a document collection, with the collection's own kind", async () => {
+    const result = await inspect({ connection_id: "seed:documents" });
+    expect(result.isError ?? false).toBe(false);
+    expect(result.structuredContent?.total_tables).toBe(1);
+    expect(result.structuredContent?.tables[0]).toMatchObject({ kind: "collection" });
+    expect(result.structuredContent?.tables[0].columns.length).toBeGreaterThan(0);
+  });
+
+  test("works on an engine that declares no table kind, listing and describing each object by its own kind", async () => {
+    const provider = new MongoDBProvider({
+      id: "mongo",
+      name: "mongo",
+      type: "mongodb",
+      connectionString: "mongodb://127.0.0.1:1/app",
+      createdAt: new Date(),
+    });
+    const database = {
+      listCollections: () => ({
+        toArray: async () => [
+          { name: "orders", type: "collection" },
+          { name: "big_orders", type: "view", options: { viewOn: "orders", pipeline: [] } },
+        ],
+      }),
+      collection: () => ({
+        find: () => ({ limit: () => ({ toArray: async () => [{ _id: 1, total: 5 }] }) }),
+        indexes: async () => [{ name: "_id_", key: { _id: 1 }, unique: true }],
+      }),
+      admin: () => ({ command: async () => ({ databases: [{ name: "app" }], ok: 1 }) }),
+    };
+    Object.assign(provider, { client: { db: () => database }, db: database });
+    (provider as unknown as { state: { connected: boolean } }).state.connected = true;
+    const connection = {
+      id: "seed:mongo",
+      name: "mongo",
+      type: "mongodb" as const,
+      seedId: "mongo",
+      createdAt: new Date(),
+    };
+    const context = {
+      caller: { username: "alice", role: "admin" as const },
+      resolve: async () => connection,
+      acquire: async () => provider,
+    } as unknown as McpConnectionContext;
+    const result = await inspectSchema(InspectSchemaInputSchema.parse({ connection_id: "seed:mongo" }), {
+      context,
+      signal: new AbortController().signal,
+    });
+    expect(result.isError ?? false).toBe(false);
+    const page = result.structuredContent as {
+      total_tables: number;
+      tables: Array<{ name: string; kind: string; columns: Array<{ name: string }> }>;
+    };
+    expect(page.total_tables).toBe(2);
+    expect(page.tables.map((entry) => [entry.name, entry.kind])).toEqual([
+      ["orders", "collection"],
+      ["big_orders", "view"],
+    ]);
+    expect(page.tables[0].columns.map((column) => column.name)).toContain("total");
+    expect(mcpEvents().at(-1)).toMatchObject({ target: "mcp/execution", result: "success" });
   });
 });
 

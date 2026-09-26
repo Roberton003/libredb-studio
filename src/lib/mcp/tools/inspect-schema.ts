@@ -1,6 +1,6 @@
 import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
-import { containerDepth } from "@/lib/db/object-kinds";
+import { containerDepth, relationKindIds } from "@/lib/db/object-kinds";
 import type { Container, DatabaseObject, DatabaseProvider } from "@/lib/db/types";
 import {
   newMcpCorrelationId,
@@ -143,7 +143,7 @@ async function inspectTable(
   args: InspectSchemaInput,
 ): Promise<InspectedTable> {
   const detail =
-    args.include_columns || args.include_indexes ? await provider.describeObject(object.path, "table") : null;
+    args.include_columns || args.include_indexes ? await provider.describeObject(object.path, object.kind) : null;
   const rawComment = (detail === null ? undefined : commentOf(detail)) ?? commentOf(object);
   const comment = rawComment === undefined ? undefined : cutUtf8(rawComment, MCP_TABLE_COMMENT_CAP_BYTES);
   const columns = detail?.columns ?? [];
@@ -196,6 +196,17 @@ function pageResult(
   });
 }
 
+/**
+ * The objects the page is read from: every kind the engine declares with the relation role, in
+ * declared order, because not every engine has a "table" kind. MongoDB lists collections and
+ * views, Redis keyspaces, the search engines indexes, and a LibreDB store holds collections and
+ * keyspaces beside its tables. Each object is later described under its own kind.
+ */
+async function listRelations(provider: DatabaseProvider, container: readonly string[]): Promise<DatabaseObject[]> {
+  const kinds = relationKindIds(provider.getCapabilities());
+  return (await Promise.all(kinds.map((kind) => provider.listObjects(container, kind)))).flat();
+}
+
 async function readPage(
   provider: DatabaseProvider,
   args: InspectSchemaInput,
@@ -205,7 +216,7 @@ async function readPage(
   if (choice.kind === "not-found")
     return { result: ownWordsError(SCHEMA_NOT_FOUND_TEXT), failure: "mcp_schema_not_found" };
   const container = choice.kind === "found" ? choice.container : null;
-  const objects = choice.kind === "none" ? [] : await provider.listObjects(container?.path ?? [], "table");
+  const objects = choice.kind === "none" ? [] : await listRelations(provider, container?.path ?? []);
   const wanted = args.table?.toLowerCase();
   const filtered = wanted === undefined ? objects : objects.filter((object) => object.name.toLowerCase() === wanted);
   const tables: InspectedTable[] = [];
