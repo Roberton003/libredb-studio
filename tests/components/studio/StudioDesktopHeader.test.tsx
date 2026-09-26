@@ -302,6 +302,12 @@ describe("StudioDesktopHeader", () => {
       expect(onLogout).toHaveBeenCalledTimes(1);
     });
 
+    test("offers every signed-in user the MCP settings screen", () => {
+      const { getByText } = render(<StudioDesktopHeader {...defaultProps} isAdmin={false} user={{ role: "user" }} />);
+      fireEvent.click(getByText("MCP"));
+      expect(mockRouterPush).toHaveBeenCalledWith("/settings/mcp");
+    });
+
     test("Logout menu item has danger-token styling", () => {
       const { getByText } = render(<StudioDesktopHeader {...defaultProps} />);
       const logoutItem = getByText("Logout").closest('[role="menuitem"]');
