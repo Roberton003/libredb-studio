@@ -27,6 +27,18 @@ describe("MCP Safe Serializer", () => {
     expect(serialized.binaryData).toBe("[Blob: 4 bytes]");
   });
 
+  test("keeps a column named __proto__ as an own key, and never as the row's prototype", () => {
+    const row = JSON.parse('{"__proto__": 1, "doc": {"__proto__": {"polluted": true}}}') as Record<string, unknown>;
+    const serialized = safeSerialize(row) as Record<string, unknown>;
+    expect(Object.keys(serialized)).toEqual(["__proto__", "doc"]);
+    expect(Object.getPrototypeOf(serialized)).toBe(Object.prototype);
+    const nested = serialized.doc as Record<string, unknown>;
+    expect(Object.getPrototypeOf(nested)).toBe(Object.prototype);
+    expect(Object.hasOwn(nested, "__proto__")).toBe(true);
+    expect("polluted" in nested).toBe(false);
+    expect(safeJsonStringify(row)).toBe('{"__proto__":1,"doc":{"__proto__":{"polluted":true}}}');
+  });
+
   test("serializes Date to ISO string", () => {
     const d = new Date("2026-09-20T21:00:00.000Z");
     const raw = { created_at: d };

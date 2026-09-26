@@ -52,11 +52,9 @@ function serializeValue(value: unknown, seen = new WeakSet<object>()): unknown {
         return value.map((item) => serializeValue(item, seen));
       }
 
-      const result: Record<string, unknown> = {};
-      for (const [k, v] of Object.entries(value)) {
-        result[k] = serializeValue(v, seen);
-      }
-      return result;
+      // fromEntries defines own data properties, so a column named __proto__ stays a key
+      // instead of reaching the prototype setter an assignment would call.
+      return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, serializeValue(v, seen)]));
     } catch {
       return String(value);
     } finally {

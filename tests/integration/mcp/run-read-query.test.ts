@@ -153,6 +153,13 @@ describe("the answer", () => {
     },
   );
 
+  test("keeps the value of a column named __proto__ in both the JSON text and the structured rows", async () => {
+    const result = await query({ connection_id: "seed:shop", sql: 'SELECT 1 AS "__proto__"' });
+    expect(result.isError ?? false).toBe(false);
+    expect(result.content[1].text).toContain('"rows":[{"__proto__":1}]');
+    expect(Object.hasOwn(result.structuredContent?.rows[0], "__proto__")).toBe(true);
+  });
+
   test("never quotes a fake column or a TRUNCATED marker", async () => {
     const result = await query({ connection_id: "seed:shop", sql: "SELECT id, pad FROM kilobyte_rows ORDER BY id" });
     expect(JSON.stringify(result)).not.toContain("TRUNCATED");
