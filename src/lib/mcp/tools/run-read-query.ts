@@ -14,7 +14,12 @@ import {
   type McpCallRecord,
   type McpToolAuditReason,
 } from "../audit";
-import type { McpConnectionContext, McpToolCall } from "../context";
+import {
+  MCP_CONNECTIONS_UNREADABLE,
+  MCP_CONNECTIONS_UNREADABLE_TEXT,
+  type McpConnectionContext,
+  type McpToolCall,
+} from "../context";
 import { checkReadOnlyStatement } from "../guards/execution-fence";
 import {
   engineError,
@@ -222,6 +227,8 @@ export async function runReadQuery(args: RunReadQueryInput, call: McpToolCall): 
 
   if (call.signal.aborted) return refuse(record, "mcp_cancelled", MCP_CANCELLED_TEXT);
   const connection = await call.context.resolve(args.connection_id);
+  if (connection === MCP_CONNECTIONS_UNREADABLE)
+    return refuse(record, "mcp_connections_unreadable", MCP_CONNECTIONS_UNREADABLE_TEXT);
   if (connection === null) return refuse(record, "mcp_connection_not_visible", MCP_NOT_VISIBLE_TEXT);
   const resolved: McpCallRecord = { ...record, connectionName: connection.seedId };
   const violation = checkReadOnlyStatement(args.sql);

@@ -9,7 +9,12 @@ import {
   type McpCallRecord,
   type McpToolAuditReason,
 } from "../audit";
-import type { McpConnectionContext, McpToolCall } from "../context";
+import {
+  MCP_CONNECTIONS_UNREADABLE,
+  MCP_CONNECTIONS_UNREADABLE_TEXT,
+  type McpConnectionContext,
+  type McpToolCall,
+} from "../context";
 import {
   cutUtf8,
   engineError,
@@ -231,6 +236,8 @@ export async function inspectSchema(args: InspectSchemaInput, call: McpToolCall)
 
   if (call.signal.aborted) return refuse("mcp_cancelled", MCP_CANCELLED_TEXT);
   const connection = await call.context.resolve(args.connection_id);
+  if (connection === MCP_CONNECTIONS_UNREADABLE)
+    return refuse("mcp_connections_unreadable", MCP_CONNECTIONS_UNREADABLE_TEXT);
   if (connection === null) return refuse("mcp_connection_not_visible", MCP_NOT_VISIBLE_TEXT);
 
   const resolved: McpCallRecord = { ...record, connectionName: connection.seedId };

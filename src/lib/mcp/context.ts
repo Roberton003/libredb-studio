@@ -6,6 +6,11 @@ import { logger } from "@/lib/logger";
 import { getManagedConnections, type ManagedConnection } from "@/lib/seed";
 import { redactError } from "./serializer";
 
+/** The answer of a context whose seed file could not be loaded; the cause is logged, never sent. */
+export const MCP_CONNECTIONS_UNREADABLE = "unreadable";
+export const MCP_CONNECTIONS_UNREADABLE_TEXT =
+  "The connection configuration could not be read, so no connection is available. The server log names the cause.";
+
 /**
  * The MCP tools' view of the connections one caller may use (#246).
  *
@@ -19,6 +24,9 @@ import { redactError } from "./serializer";
  * GHSA-3wh2-8x78-jfw4 closed (src/lib/db/provider-cache-key.ts). After the key is awaited, the
  * lookup and the insertion happen in one synchronous step, and a settled acquisition leaves the
  * map, so a failed one is retried by the next caller.
+ *
+ * A seed file that cannot be loaded answers MCP_CONNECTIONS_UNREADABLE, which every tool turns
+ * into its own explicit error.
  */
 
 export interface McpCaller {
@@ -44,17 +52,19 @@ export function mcpCaller(authInfo: AuthInfo): McpCaller {
 const pendingAcquisitions = new Map<string, Promise<DatabaseProvider>>();
 
 export class McpConnectionContext {
-  private visible: Promise<readonly ManagedConnection[]> | null = null;
+  private visible: Promise<readonly ManagedConnection[] | typeof MCP_CONNECTIONS_UNREADABLE> | null = null;
 
   constructor(readonly caller: McpCaller) {}
 
-  visibleConnections(): Promise<readonly ManagedConnection[]> {
+  visibleConnections(): Promise<readonly ManagedConnection[] | typeof MCP_CONNECTIONS_UNREADABLE> {
     this.visible ??= this.load();
     return this.visible;
   }
 
-  async resolve(connectionId: string): Promise<ManagedConnection | null> {
-    return (await this.visibleConnections()).find((connection) => connection.id === connectionId) ?? null;
+  async resolve(connectionId: string): Promise<ManagedConnection | null | typeof MCP_CONNECTIONS_UNREADABLE> {
+    const visible = await this.visibleConnections();
+    if (visible === MCP_CONNECTIONS_UNREADABLE) return visible;
+    return visible.find((connection) => connection.id === connectionId) ?? null;
   }
 
   async acquire(connection: ManagedConnection, profile: ExecutionProfile): Promise<DatabaseProvider> {
@@ -68,16 +78,19 @@ export class McpConnectionContext {
     return acquisition;
   }
 
-  private async load(): Promise<readonly ManagedConnection[]> {
+  /**
+   * Only what the operator opted in: a seed entry without mcp: true, and every built-in sample,
+   * is not visible. A file that cannot be loaded is an answer of its own, never an empty list,
+   * because an empty list would tell the client there is nothing to reach when the truth is that
+   * the server could not tell.
+   */
+  private async load(): Promise<readonly ManagedConnection[] | typeof MCP_CONNECTIONS_UNREADABLE> {
     try {
-      return await getManagedConnections([this.caller.role]);
+      const connections = await getManagedConnections([this.caller.role]);
+      return connections.filter((connection) => connection.mcp === true);
     } catch (error) {
-      // The pre-SDK route's behaviour, kept until an unreadable seed file becomes an explicit answer.
-      logger.warn("Could not load managed connections for MCP", {
-        role: this.caller.role,
-        error: redactError(error).message,
-      });
-      return [];
+      logger.error("Could not load managed connections for MCP", redactError(error), { route: "/api/mcp" });
+      return MCP_CONNECTIONS_UNREADABLE;
     }
   }
 }

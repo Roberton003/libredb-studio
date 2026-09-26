@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { SQLiteProvider } from "@/lib/db/providers/sql/sqlite";
 import { logger } from "@/lib/logger";
-import { McpConnectionContext } from "@/lib/mcp/context";
+import { MCP_CONNECTIONS_UNREADABLE, McpConnectionContext } from "@/lib/mcp/context";
 import {
   countMethod,
   createSqliteFile,
@@ -42,13 +42,20 @@ afterAll(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
+async function visibleIds(context: McpConnectionContext): Promise<string[]> {
+  const visible = await context.visibleConnections();
+  if (visible === MCP_CONNECTIONS_UNREADABLE) throw new Error("the seed file could not be read");
+  return visible.map((connection) => connection.id);
+}
+
 function seedShop(): void {
   writeSeedFile(dir, [{ id: "shop", type: "sqlite", database: join(dir, "shop.db") }]);
 }
 
 async function shopConnection(context: McpConnectionContext) {
   const connection = await context.resolve("seed:shop");
-  if (connection === null) throw new Error("the seed connection seed:shop did not resolve");
+  if (connection === null || connection === MCP_CONNECTIONS_UNREADABLE)
+    throw new Error("the seed connection seed:shop did not resolve");
   return connection;
 }
 
@@ -58,7 +65,7 @@ describe("the seed file", () => {
     const context = new McpConnectionContext(alice);
     seedShop();
 
-    expect((await context.visibleConnections()).map((connection) => connection.id)).toEqual(["seed:shop"]);
+    expect(await visibleIds(context)).toEqual(["seed:shop"]);
   });
 
   test("is read once per context, so one request sees one list", async () => {
@@ -69,23 +76,30 @@ describe("the seed file", () => {
 
     expect(await context.visibleConnections()).toBe(first);
     // The control: a new context reads the rewritten file.
-    expect((await new McpConnectionContext(alice).visibleConnections()).map((c) => c.id)).toEqual(["seed:other"]);
+    expect(await visibleIds(new McpConnectionContext(alice))).toEqual(["seed:other"]);
   });
 
-  test("that cannot be parsed pins today's defect, not a goal: an empty list and a warning, until the explicit unreadable answer replaces it", async () => {
-    // Today's silent fallback, kept through the protocol rewrite only because the pre-SDK route
-    // had it (src/app/api/mcp/route.ts:98-107). The unreadable-configuration answer replaces this
-    // test; nothing may build on the empty list it asserts.
+  test("that cannot be parsed answers unreadable, and the cause goes to the server log", async () => {
     const path = join(dir, "broken.json");
     writeFileSync(path, "{ this is not json");
     process.env.SEED_CONFIG_PATH = path;
-    const warn = spyOn(logger, "warn");
+    const errorLog = spyOn(logger, "error").mockImplementation(() => {});
     try {
-      expect(await new McpConnectionContext(alice).visibleConnections()).toEqual([]);
-      expect(warn.mock.calls.some(([message]) => message === "Could not load managed connections for MCP")).toBe(true);
+      const context = new McpConnectionContext(alice);
+      expect(await context.visibleConnections()).toBe(MCP_CONNECTIONS_UNREADABLE);
+      expect(await context.resolve("seed:shop")).toBe(MCP_CONNECTIONS_UNREADABLE);
+      expect(errorLog.mock.calls.map(([message]) => message)).toEqual(["Could not load managed connections for MCP"]);
     } finally {
-      warn.mockRestore();
+      errorLog.mockRestore();
     }
+  });
+
+  test("holds only the connections opted in with mcp: true", async () => {
+    writeSeedFile(dir, [
+      { id: "shop", type: "sqlite", database: join(dir, "shop.db") },
+      { id: "silent", type: "sqlite", database: join(dir, "shop.db"), mcp: null },
+    ]);
+    expect(await visibleIds(new McpConnectionContext(alice))).toEqual(["seed:shop"]);
   });
 });
 
@@ -94,7 +108,7 @@ describe("resolve", () => {
     seedShop();
     const context = new McpConnectionContext(alice);
 
-    expect((await context.resolve("seed:shop"))?.seedId).toBe("shop");
+    expect(await context.resolve("seed:shop")).toMatchObject({ seedId: "shop" });
     expect(await context.resolve("seed:missing")).toBeNull();
     expect(await context.resolve("shop")).toBeNull();
   });

@@ -3,7 +3,12 @@ import { z } from "zod";
 import { isFileBased } from "@/lib/db-ui-config";
 import type { ManagedConnection } from "@/lib/seed";
 import { newMcpCorrelationId, recordMcpDecision, type McpCallRecord } from "../audit";
-import type { McpConnectionContext, McpToolCall } from "../context";
+import {
+  MCP_CONNECTIONS_UNREADABLE,
+  MCP_CONNECTIONS_UNREADABLE_TEXT,
+  type McpConnectionContext,
+  type McpToolCall,
+} from "../context";
 import {
   MCP_READ_ONLY_ANNOTATIONS,
   MCP_RESULT_CAP_BYTES,
@@ -97,7 +102,14 @@ async function listConnections(args: ListConnectionsInput, call: McpToolCall): P
     user: call.context.caller.username,
     correlationId: newMcpCorrelationId(),
   };
-  const matching = (await call.context.visibleConnections())
+  const visible = await call.context.visibleConnections();
+  if (visible === MCP_CONNECTIONS_UNREADABLE) {
+    return (
+      recordOrRefuse(() => recordMcpDecision(record, "mcp_connections_unreadable")) ??
+      ownWordsError(MCP_CONNECTIONS_UNREADABLE_TEXT)
+    );
+  }
+  const matching = visible
     .filter((connection) => args.environment === "all" || connection.environment === args.environment)
     .map(listed);
   const result = page(matching, args.offset);
