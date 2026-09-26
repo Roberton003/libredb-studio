@@ -63,6 +63,7 @@ import {
 import { comparePaths } from "../../object-path";
 import { unquoteLiteral } from "@/lib/sql/values";
 import { CACHE_HIT_RATIO_UNAVAILABLE } from "@/lib/monitoring-cache-ratio";
+import { logger } from "@/lib/logger";
 import * as fs from "fs";
 import * as path from "path";
 
@@ -879,6 +880,45 @@ function objectDetailFromRows(path: readonly string[], rows: ObjectDetailRows): 
 }
 
 // ============================================================================
+// A database file this process cannot write
+// ============================================================================
+
+/**
+ * The `access()` refusals that mean "this process may not write here": no permission
+ * (`EACCES`, `EPERM`) or a read-only filesystem (`EROFS`, a `:ro` Docker mount). Any
+ * other answer is a real failure and is raised as one.
+ */
+const NOT_WRITABLE_CODES: ReadonlySet<string> = new Set(["EACCES", "EPERM", "EROFS"]);
+
+/**
+ * True when `dbPath` names an existing file that this process cannot write, or whose
+ * directory it cannot write. The directory counts because the WAL journal the editor
+ * turns on keeps its `-wal` and `-shm` files beside the database. A missing file answers
+ * false: the editor creates it, exactly as before.
+ */
+function isUnwritableExistingFile(dbPath: string): boolean {
+  if (dbPath === ":memory:" || !fs.existsSync(dbPath)) {
+    return false;
+  }
+  for (const target of [dbPath, path.dirname(dbPath)]) {
+    try {
+      fs.accessSync(target, fs.constants.W_OK);
+    } catch (error) {
+      if (NOT_WRITABLE_CODES.has((error as NodeJS.ErrnoException).code ?? "")) {
+        return true;
+      }
+      throw error;
+    }
+  }
+  return false;
+}
+
+/** SQLite's SQLITE_READONLY refusal, in the words both drivers raise it with. */
+function isReadOnlyWriteError(error: unknown): boolean {
+  return error instanceof Error && error.message.includes("attempt to write a readonly database");
+}
+
+// ============================================================================
 // Agent read-only execution profile (#328)
 // ============================================================================
 
@@ -1013,6 +1053,8 @@ export class SQLiteProvider extends SQLBaseProvider {
   private db: SQLiteDatabase | null = null;
   /** True when this instance was opened under the agent read-only profile. */
   private readonly readOnlyProfile: boolean;
+  /** The file's path when the editor opened it read-only because this process cannot write it; else null. */
+  private unwritableFilePath: string | null = null;
 
   constructor(config: DatabaseConnection, options: ProviderOptions = {}, execution: ProviderExecutionContext = {}) {
     super(config, options);
@@ -1110,6 +1152,11 @@ export class SQLiteProvider extends SQLBaseProvider {
         return;
       }
 
+      if (isUnwritableExistingFile(dbPath)) {
+        this.connectUnwritableFile(SQLiteDB, dbPath);
+        return;
+      }
+
       if (dbPath !== ":memory:") {
         const dir = path.dirname(dbPath);
         if (!fs.existsSync(dir)) {
@@ -1153,11 +1200,42 @@ export class SQLiteProvider extends SQLBaseProvider {
         throw error;
       }
 
-      throw new ConnectionError(
-        `Failed to open SQLite database: ${error instanceof Error ? error.message : error}`,
-        "sqlite",
-      );
+      const reason = error instanceof Error ? error.message : String(error);
+      // The one read-only open SQLite refuses outright: see `connectUnwritableFile`.
+      const walHint =
+        this.unwritableFilePath !== null && isReadOnlyWriteError(error)
+          ? `${this.unwritableFilePath} is open read-only because this process cannot write the file or its directory, and a file in WAL journal mode cannot be read without a -shm file beside it; switch it to a rollback journal (PRAGMA journal_mode = DELETE) where it is writable, or make its directory writable: `
+          : "";
+      throw new ConnectionError(`Failed to open SQLite database: ${walHint}${reason}`, "sqlite");
     }
+  }
+
+  /**
+   * Open, for the editor, an existing file this process cannot write: a read-only
+   * Docker mount, or a file owned by another user. The shared sequence above cannot
+   * open one at all, because `PRAGMA journal_mode = WAL` is a write (and WAL needs its
+   * `-wal` and `-shm` files beside the database), so every read used to fail with
+   * "attempt to write a readonly database".
+   *
+   * The handle is SQLite's own read-only open, without `create` and without the WAL
+   * pair, so reads work and a write is refused by the engine; `query()` names that
+   * refusal. `query_only` is NOT set: this is the editor, and the file's permissions
+   * are the boundary, not a profile.
+   *
+   * A file already in WAL journal mode still cannot be opened when its directory is
+   * unwritable: SQLite reads one only with a `-shm` file beside it (measured on
+   * bun:sqlite and node:sqlite, 2026-09-26). `connect()` names that case.
+   */
+  private connectUnwritableFile(SQLiteDB: Awaited<ReturnType<typeof loadSQLiteDriver>>, dbPath: string): void {
+    this.unwritableFilePath = dbPath;
+    logger.info(`[SQLite] Opening ${dbPath} read-only: this process cannot write the file or its directory`, {
+      provider: "sqlite",
+    });
+    this.db = new SQLiteDB(dbPath, { readonly: true });
+    this.db.exec("PRAGMA foreign_keys = ON");
+    // A file in WAL mode fails here rather than at the open: SQLite opens its files lazily.
+    this.db.prepare("PRAGMA journal_mode").get();
+    this.setConnected(true);
   }
 
   /**
@@ -1286,6 +1364,13 @@ export class SQLiteProvider extends SQLBaseProvider {
             };
           }
         } catch (error) {
+          if (this.unwritableFilePath !== null && isReadOnlyWriteError(error)) {
+            throw new QueryError(
+              `SQLite database ${this.unwritableFilePath} is open read-only because this process cannot write the file or its directory: ${(error as Error).message}`,
+              "sqlite",
+              sql,
+            );
+          }
           throw mapDatabaseError(error, "sqlite", sql);
         }
       });

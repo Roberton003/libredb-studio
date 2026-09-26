@@ -172,7 +172,8 @@ directories are created on connect.
 — FK enforcement on, WAL for better
 concurrency, NORMAL sync for a speed/durability balance. The agent read-only profile runs a
 different open sequence entirely — `journal_mode = WAL` is itself a write and fails on a read-only
-handle ([§12.1](#121-where-the-boundary-is)).
+handle ([§12.1](#121-where-the-boundary-is)). So does an existing file this process cannot write
+([§3.7](#37-a-database-file-this-process-cannot-write)).
 
 `disconnect()` closes with `close(true)`, and the argument is load-bearing. Bare `close()` on
 `bun:sqlite` is `sqlite3_close_v2`: with any statement still unfinalized the connection becomes a
@@ -333,6 +334,28 @@ cannot be resolved without the affinity, and the integer reading is the one thes
 ordinary textual key still matches as text, `'007'` included (measured: both match, both stored as
 `text`). A value written through THIS provider into a no-affinity column is stored as an integer and
 round-trips consistently.
+
+### 3.7 A database file this process cannot write
+
+A read-only Docker mount (`:ro`), or a file owned by another user, cannot take the [§3.2](#32-pragmas-on-connect) sequence: `journal_mode = WAL` is a write, and WAL keeps its `-wal` and `-shm` files beside the database.
+Before this, such a file could not be opened at all, and health, inventory and counts all failed with "attempt to write a readonly database".
+
+So `connect()` first asks the filesystem, through `access(W_OK)`, whether it may write an existing file and its directory.
+When either answer is `EACCES`, `EPERM` or `EROFS`, it opens the file with SQLite's own read-only open: no `create`, no `journal_mode = WAL`, no `synchronous`, only `foreign_keys = ON`.
+It logs that decision once, at info, with the path.
+Any other answer from `access()` is raised as a `ConnectionError`, not read as read-only.
+A missing file, `:memory:` and a writable file keep the §3.2 sequence exactly.
+
+Reads, health, the object surface and counts work as on any file.
+A write is refused by SQLite itself, and `query()` raises it as a `QueryError` that names the file and why: "SQLite database `<path>` is open read-only because this process cannot write the file or its directory: attempt to write a readonly database".
+`query_only` is not set: this is the editor, and the file's permissions are the boundary, not the agent profile of [§12](#12-agent-read-only-execution-profile-328).
+
+A file already in WAL journal mode still cannot be opened when its directory is unwritable: SQLite reads one only with a `-shm` file beside it, and has nowhere to make one (measured on `bun:sqlite` and `node:sqlite`, 2026-09-26).
+That includes any file this editor has written, because §3.2 leaves the file in WAL mode.
+`connect()` then fails with a `ConnectionError` that says so and names the two ways out: run `PRAGMA journal_mode = DELETE` on the file where it is writable, or make its directory writable.
+
+Both drivers take the same path.
+The tests use a real file with mode 0444 in a directory with mode 0555, and are skipped as root, where modes restrict nothing, and on Windows, which enforces no directory mode; the Linux CI job runs as an ordinary user and covers them.
 
 ---
 
@@ -1144,7 +1167,8 @@ sends no target, so `runMaintenance('reindex')` here runs a bare `REINDEX`
 ## 10. Error handling
 
 SQLite uses the shared `mapDatabaseError()` ([errors.ts](../../src/lib/db/errors.ts)) with **no**
-SQLite-specific branches:
+SQLite-specific branches; the provider names the read-only file cases itself
+([§3.7](#37-a-database-file-this-process-cannot-write)):
 
 | Situation | Error |
 |-----------|-------|
@@ -1152,6 +1176,9 @@ SQLite-specific branches:
 | NUL byte in path | `DatabaseConfigError` ("Invalid database path: NUL bytes are not allowed") |
 | Selected driver unavailable (no `bun:sqlite` / `node:sqlite` on this runtime) | `DatabaseConfigError` ("SQLite driver … is not available…") |
 | Open failure | `ConnectionError` |
+| Write check on an existing file fails with anything but `EACCES` / `EPERM` / `EROFS` | `ConnectionError` with the filesystem's message |
+| WAL-mode file in a directory this process cannot write | `ConnectionError` naming WAL and the two ways out |
+| Write statement on a file opened read-only because it is not writable | `QueryError` ("SQLite database `<path>` is open read-only because …") |
 | Statement errors whose message matches a heuristic (e.g. *syntax error*, *no such column*) | `QueryError` |
 | Other engine errors | generic `QueryError` / `DatabaseError` with the original message |
 

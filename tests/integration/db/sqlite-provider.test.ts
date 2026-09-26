@@ -9,7 +9,9 @@
 
 import { describe, test, expect, afterEach, beforeAll, afterAll, spyOn } from "bun:test";
 import { spawnSync } from "node:child_process";
+import { Database as BunDatabase } from "bun:sqlite";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -62,6 +64,8 @@ import { CACHE_HIT_RATIO_UNAVAILABLE } from "@/lib/monitoring-cache-ratio";
 import { buildResultExport } from "@/lib/export/result-export";
 import { comparePaths } from "@/lib/db/object-path";
 import { readFixtureStatements } from "../../../docker/sqlite-init/build-fixture";
+import { logger } from "@/lib/logger";
+import { MISSING_POSIX_FILE_MODES, describeIf, testIf } from "../../helpers/posix-tools";
 
 // ============================================================================
 // Helpers
@@ -4467,6 +4471,234 @@ describe("SQLiteProvider column defaults (#1029)", () => {
         // Ignore cleanup errors
       }
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ============================================================================
+// A database file this process cannot write
+// ----------------------------------------------------------------------------
+// A read-only Docker mount, or a file owned by another user. The editor used to open
+// every file read-write with `create` and `PRAGMA journal_mode = WAL`, so such a file
+// could not be opened at all: health, inventory and counts all answered 503 with
+// "attempt to write a readonly database", while the agent's read-only handle read it
+// fine (reproduced 2026-09-26 in Docker as uid 1001 with the file mounted `:ro`).
+//
+// The mode bits are the fixture, so the test cannot run where they mean nothing: root
+// passes every permission check, and Windows enforces no directory mode. The Linux CI job
+// runs as an ordinary user, which is where these lines are covered.
+// ============================================================================
+
+const MISSING_UNWRITABLE_FILE: string | null =
+  MISSING_POSIX_FILE_MODES ??
+  (process.getuid?.() === 0 ? "running as root: file modes do not restrict root, so nothing is unwritable" : null);
+
+/**
+ * A database of three orders in `dir`, then made unwritable: 0444 on the file and 0555 on
+ * the directory. Written with the driver directly rather than through the provider, because
+ * the provider leaves a file in WAL mode, and that is its own fixture (see "a WAL-mode file"
+ * below).
+ */
+function writeUnwritableFixture(dir: string, journalMode: "delete" | "wal"): string {
+  mkdirSync(dir, { recursive: true });
+  const file = join(dir, "shop.db");
+  const db = new BunDatabase(file, { create: true, readwrite: true });
+  db.exec(`PRAGMA journal_mode = ${journalMode}`);
+  db.exec("CREATE TABLE orders (id INTEGER PRIMARY KEY, customer TEXT NOT NULL, total REAL)");
+  db.exec("INSERT INTO orders VALUES (1, 'ada', 10.5), (2, 'bob', 20), (3, 'cy', 30.25)");
+  db.close(true);
+  chmodSync(file, 0o444);
+  chmodSync(dir, 0o555);
+  return file;
+}
+
+/** Bundle sqlite-node-harness.ts for Node and run one scenario with the node driver forced. */
+function runNodeHarness(dbPath: string, scenario: string): Record<string, unknown> {
+  const bundleDir = mkdtempSync(join(tmpdir(), "libredb-sqlite-node-unwritable-"));
+  try {
+    const bundlePath = join(bundleDir, "sqlite-node-harness.mjs");
+    const build = spawnSync(
+      process.execPath,
+      [
+        "build",
+        join(import.meta.dir, "sqlite-node-harness.ts"),
+        "--target=node",
+        "--format=esm",
+        "--external",
+        "bun:sqlite",
+        "--outfile",
+        bundlePath,
+      ],
+      { timeout: 60_000 },
+    );
+    if (build.error) throw new Error(`bun build could not run: ${build.error.message}`);
+    if (build.status !== 0) throw new Error(`bun build failed: ${build.stderr?.toString()}`);
+    const run = spawnSync("node", [bundlePath, dbPath, scenario], {
+      env: { ...process.env, LIBREDB_SQLITE_DRIVER: "node" },
+      timeout: 60_000,
+    });
+    if (run.error) throw new Error(`node harness could not run: ${run.error.message}`);
+    if (run.status !== 0) throw new Error(`node harness failed: ${run.stderr?.toString()}`);
+    // The report is the last line; the logger writes to stdout too, and its lines come back
+    // beside the report as `logLines`.
+    const lines = run.stdout.toString().trim().split("\n");
+    const report = JSON.parse(lines.pop()!) as Record<string, unknown>;
+    return { ...report, logLines: lines };
+  } finally {
+    rmSync(bundleDir, { recursive: true, force: true });
+  }
+}
+
+const READ_ONLY_INSERT_MESSAGE = (file: string) =>
+  `SQLite database ${file} is open read-only because this process cannot write the file or its directory: attempt to write a readonly database`;
+
+describe("SQLiteProvider on a database file this process cannot write", () => {
+  let root: string;
+  let infoSpy: { mockRestore(): void } | undefined;
+
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "libredb-sqlite-unwritable-"));
+  });
+
+  afterAll(() => {
+    // The fixtures took the write bit off their directories, and rmSync needs it back.
+    for (const entry of readdirSync(root)) chmodSync(join(root, entry), 0o755);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  afterEach(() => {
+    infoSpy?.mockRestore();
+    infoSpy = undefined;
+  });
+
+  /** The info lines that announced a read-only open. */
+  function readOnlyDecisions(spy: { mock: { calls: unknown[][] } }): string[] {
+    return spy.mock.calls.map(([message]) => String(message)).filter((message) => message.includes("read-only"));
+  }
+
+  describeIf(MISSING_UNWRITABLE_FILE, "with file mode 0444 in a directory with mode 0555", () => {
+    test("connects read-only, answers health, lists objects and runs a SELECT", async () => {
+      const dir = join(root, "readonly");
+      const file = writeUnwritableFixture(dir, "delete");
+      const spy = spyOn(logger, "info");
+      infoSpy = spy;
+      const db = new SQLiteProvider(makeSQLiteConfig({ database: file }));
+      try {
+        await db.connect();
+        expect(db.isConnected()).toBe(true);
+
+        // The decision is logged once, with the path, at info.
+        const decisions = readOnlyDecisions(spy);
+        expect(decisions).toHaveLength(1);
+        expect(decisions[0]).toContain(file);
+
+        const health = await db.getHealth();
+        expect(health.slowQueries.find((sq) => sq.query.includes("Integrity"))!.query).toContain("OK");
+        // Still the file's own rollback journal: nothing tried to switch it to WAL.
+        expect((await db.query("PRAGMA journal_mode")).rows).toEqual([{ journal_mode: "delete" }]);
+
+        expect((await db.listObjects([], "table")).map((object) => object.name)).toEqual(["orders"]);
+        expect((await db.countObjects([])).table).toEqual({ count: 1 });
+
+        const select = await db.query("SELECT customer, total FROM orders ORDER BY id");
+        expect(select.rows).toEqual([
+          { customer: "ada", total: 10.5 },
+          { customer: "bob", total: 20 },
+          { customer: "cy", total: 30.25 },
+        ]);
+      } finally {
+        await db.disconnect();
+      }
+      // A read-only open leaves no sidecar behind, and could not create one anyway.
+      expect(readdirSync(dir)).toEqual(["shop.db"]);
+    });
+
+    test("an INSERT fails with SQLite's read-only error, named as such", async () => {
+      const file = join(root, "readonly", "shop.db");
+      const db = new SQLiteProvider(makeSQLiteConfig({ database: file }));
+      try {
+        await db.connect();
+        const insert = db.query("INSERT INTO orders VALUES (4, 'dee', 1)");
+        await expect(insert).rejects.toBeInstanceOf(QueryError);
+        await expect(insert).rejects.toThrow(READ_ONLY_INSERT_MESSAGE(file));
+        expect((await db.query("SELECT COUNT(*) AS n FROM orders")).rows).toEqual([{ n: 3 }]);
+      } finally {
+        await db.disconnect();
+      }
+    });
+
+    // SQLite reads a WAL-mode file only with a `-shm` file beside it, and a directory it
+    // cannot write gives it nowhere to make one, so even a read-only handle is refused
+    // (measured on bun:sqlite and node:sqlite, 2026-09-26). The provider cannot change
+    // that, but it can say why instead of passing on "attempt to write a readonly database".
+    test("a WAL-mode file is refused with the reason and the way out", async () => {
+      const file = writeUnwritableFixture(join(root, "wal"), "wal");
+      const db = new SQLiteProvider(makeSQLiteConfig({ database: file }));
+      const connect = db.connect();
+      await expect(connect).rejects.toBeInstanceOf(ConnectionError);
+      await expect(connect).rejects.toThrow(
+        `Failed to open SQLite database: ${file} is open read-only because this process cannot write the file or its directory, and a file in WAL journal mode cannot be read without a -shm file beside it; switch it to a rollback journal (PRAGMA journal_mode = DELETE) where it is writable, or make its directory writable: attempt to write a readonly database`,
+      );
+      expect(db.isConnected()).toBe(false);
+    });
+
+    testIf(
+      nodeDriverTestable ? null : "`node` with node:sqlite is not available on this machine",
+      "the same file under LIBREDB_SQLITE_DRIVER=node (node:sqlite)",
+      () => {
+        const dir = join(root, "readonly");
+        const file = join(dir, "shop.db");
+        const report = runNodeHarness(file, "unwritable");
+        expect(report.runtime).toBe("node");
+        expect(report.driverEnv).toBe("node");
+        expect(report.connected).toBe(true);
+        const decisions = (report.logLines as string[]).filter((line) => line.includes("read-only"));
+        expect(decisions).toHaveLength(1);
+        expect(decisions[0]).toContain(file);
+        expect(report.integrity).toContain("OK");
+        expect(report.journalMode).toEqual([{ journal_mode: "delete" }]);
+        expect(report.tables).toEqual(["orders"]);
+        expect(report.count).toEqual([{ n: 3 }]);
+        expect(report.insertError).toBe(`QueryError: ${READ_ONLY_INSERT_MESSAGE(file)}`);
+        expect(readdirSync(dir)).toEqual(["shop.db"]);
+      },
+    );
+  });
+
+  // The control: the write check must not turn an ordinary file read-only.
+  test("a writable file still opens read-write in WAL mode", async () => {
+    const dir = join(root, "writable");
+    mkdirSync(dir);
+    const spy = spyOn(logger, "info");
+    infoSpy = spy;
+    const db = new SQLiteProvider(makeSQLiteConfig({ database: join(dir, "shop.db") }));
+    try {
+      await db.connect();
+      expect((await db.query("PRAGMA journal_mode")).rows).toEqual([{ journal_mode: "wal" }]);
+      await db.query("CREATE TABLE t (id INTEGER PRIMARY KEY)");
+      expect((await db.query("INSERT INTO t VALUES (1)")).rowCount).toBe(1);
+      expect(readOnlyDecisions(spy)).toEqual([]);
+    } finally {
+      await db.disconnect();
+    }
+  });
+
+  // The write check only turns "you may not write this" into a read-only open. Any other
+  // answer from the filesystem is a real failure and surfaces as one.
+  test("a write check that fails for another reason is raised, not read as read-only", async () => {
+    const dir = join(root, "eio");
+    mkdirSync(dir);
+    const file = join(dir, "shop.db");
+    writeFileSync(file, "");
+    const accessSpy = spyOn(fsNode, "accessSync").mockImplementation(() => {
+      throw Object.assign(new Error("EIO: i/o error, access"), { code: "EIO" });
+    });
+    const db = new SQLiteProvider(makeSQLiteConfig({ database: file }));
+    try {
+      await expect(db.connect()).rejects.toThrow("Failed to open SQLite database: EIO: i/o error, access");
+      expect(db.isConnected()).toBe(false);
+    } finally {
+      accessSpy.mockRestore();
     }
   });
 });
