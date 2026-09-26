@@ -32,11 +32,11 @@ export const MCP_NOT_VISIBLE_TEXT =
 export const MCP_CANCELLED_TEXT = "The call was cancelled before it finished.";
 
 /** Structurally a CallToolResult made of text blocks. */
-export interface ToolResult {
+export type ToolResult = {
   content: Array<{ type: "text"; text: string }>;
   structuredContent?: Record<string, unknown>;
   isError?: true;
-}
+};
 
 /** The UTF-8 length of one code point; a lone surrogate counts 3, as TextEncoder writes U+FFFD. */
 function codePointBytes(codePoint: number): number {
