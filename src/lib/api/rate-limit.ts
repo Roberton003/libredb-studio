@@ -130,11 +130,11 @@ const BUCKETS: Record<RateLimitBucket, BucketSpec> = {
   // over seven object routes, and the edit surface adds two.
   //
   // TWENTY-SIX handlers today, and there are three ways in, which is why one grep under-counts.
-  // Directly, seventeen call sites that pass bucket: "query" to guardRoute themselves
-  // (grep -rl 'bucket: "query"' src/app/api/ answers seventeen files, one call site each, verified
+  // Directly, sixteen call sites that pass bucket: "query" to guardRoute themselves
+  // (grep -rl 'bucket: "query"' src/app/api/ answers sixteen files, one call site each, verified
   // with grep -rc on the same list): admin/fleet-health, db/cancel, db/disconnect, db/health,
   // db/maintenance, db/monitoring, db/multi-query, db/pool-stats, db/profile, db/provider-meta,
-  // db/query, db/test-connection, db/transaction, mcp, and the three storage routes (storage,
+  // db/query, db/test-connection, db/transaction, and the three storage routes (storage,
   // storage/[collection], storage/migrate). Note db/health: only its POST is metered, because the
   // GET is the container health probe and takes no connection.
   // Indirectly, the NINE object routes under db/objects (containers, counts, list, describe,
@@ -145,9 +145,9 @@ const BUCKETS: Record<RateLimitBucket, BucketSpec> = {
   // directories exist; this passage used to say seven did, because the count moved ahead of the
   // last two routes landing, and a reader who counts today gets nine.
   // And by calling consumeRateLimit("query", ...) with no bucket literal at all, which is what
-  // POST /api/mcp does for a batch: one more slot for each run_read_query or inspect_schema call
-  // after the first, which its guardRoute already charged. That handler is one of the seventeen
-  // above, so this third way adds charges and not a handler.
+  // POST /api/mcp does: it verifies a bearer token instead of a session, so it cannot use
+  // guardRoute, and it charges one slot per authenticated POST before reading the body, keyed on
+  // the user the token was issued to, exactly as guardRoute keys a session.
   //
   // A SLOT IS NOT A UNIT OF COST HERE EITHER, and the two new routes are the sharpest example in
   // this bucket. An edit-apply slot runs DDL against a live engine; a db/pool-stats slot reads a

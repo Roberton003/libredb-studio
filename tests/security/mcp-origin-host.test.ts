@@ -7,10 +7,12 @@
  * below it.
  */
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import * as route from "@/app/api/mcp/route";
 import { clearRateLimitState } from "@/lib/api/rate-limit";
 import { logger } from "@/lib/logger";
 import { proxy } from "@/proxy";
 import { pinMcpTestEnvironment } from "../helpers/mcp-fixtures";
+import { routeServe } from "../helpers/mcp-harness";
 import { useMcpChannel } from "../helpers/mcp-token";
 import { originHostRequest, permissionDeniedLines } from "./helpers/mcp-requests";
 
@@ -177,5 +179,46 @@ describe("through proxy(), the two new 403s are audited", () => {
       spy.mockRestore();
       errorLog.mockRestore();
     }
+  });
+});
+
+describe("at the route, called directly so the proxy is bypassed", () => {
+  test("the foreign-Origin GET, the rebinding POST, the foreign Host POST and the Host-less GET get the proxy's 403s and lines", async () => {
+    const cases: Array<[method: "GET" | "POST", headers: Record<string, string>, message: string, reason: string]> = [
+      [
+        "GET",
+        { origin: "http://evil.example", host: "localhost:3000" },
+        "Invalid Origin: evil.example",
+        "origin_mismatch",
+      ],
+      [
+        "POST",
+        { origin: "http://evil.example", host: "evil.example", "content-type": "application/json" },
+        "Invalid Origin: evil.example",
+        "origin_mismatch",
+      ],
+      [
+        "POST",
+        { host: "evil.example", "content-type": "application/json" },
+        "Invalid Host: evil.example",
+        "mcp_host_not_allowed",
+      ],
+      ["GET", {}, "Missing Host header", "mcp_host_not_allowed"],
+    ];
+    const spy = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      for (const [method, headers, message] of cases) {
+        await sdk403(await routeServe(route)(originHostRequest(method, headers)), message);
+      }
+      expect(permissionDeniedLines(spy).map((line) => line.reason)).toEqual(cases.map(([, , , reason]) => reason));
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  test("with a matching Origin and Host the route reaches its identity step", async () => {
+    expect(
+      (await route.GET(originHostRequest("GET", { origin: "http://localhost:5173", host: "localhost:3000" }))).status,
+    ).toBe(401);
   });
 });

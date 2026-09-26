@@ -7,16 +7,29 @@
  * proxy() here; the route's own half of the boundary is below it. Every request carries an
  * explicit Host and HOSTNAME is fixed, as csrf-origin.test.ts builds requests.
  */
-import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { SignJWT } from "jose";
 import { NextRequest } from "next/server";
+import * as route from "@/app/api/mcp/route";
 import { AGENT_DRIVE_HEADER, AGENT_DRIVE_PATH, mintAgentDriveToken } from "@/lib/agent/drive-token";
 import { clearRateLimitState } from "@/lib/api/rate-limit";
 import { signJWT } from "@/lib/auth";
+import { SQLiteProvider } from "@/lib/db/providers/sql/sqlite";
 import { logger } from "@/lib/logger";
-import { proxy } from "@/proxy";
+import { MCP_ENABLED_ENV, MCP_ENABLED_INVALID_MESSAGE } from "@/lib/mcp/config";
+import { config, proxy } from "@/proxy";
 import { withBasePathEnv } from "../helpers/base-path";
-import { pinMcpTestEnvironment } from "../helpers/mcp-fixtures";
+import {
+  countMethod,
+  createSqliteFile,
+  pinMcpTestEnvironment,
+  resetMcpTestState,
+  writeSeedFile,
+} from "../helpers/mcp-fixtures";
+import { legacyPost, readJsonRpc, routeServe } from "../helpers/mcp-harness";
 import { mintTestToken, useMcpChannel } from "../helpers/mcp-token";
 import { mcpRequest, permissionDeniedLines } from "./helpers/mcp-requests";
 
@@ -243,5 +256,236 @@ describe("through proxy(), a refusal on /api/mcp is audited", () => {
       env.JWT_SECRET = secret;
       env.NODE_ENV = mode;
     }
+  });
+});
+
+const ROOT = resolve(import.meta.dir, "../..");
+
+/** A legacy run_read_query call as a NextRequest, so proxy() and the route can both take it. */
+function runQueryRequest(headers: Record<string, string> = {}): NextRequest {
+  return new NextRequest(
+    legacyPost(
+      {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: "run_read_query", arguments: { connection_id: "seed:shop", sql: "SELECT id FROM users" } },
+      },
+      { headers },
+    ),
+  );
+}
+
+describe("at the route, called directly so the proxy is bypassed", () => {
+  test("a missing or a forged bearer gets a 401 byte-identical to the proxy's", async () => {
+    const cases: Record<string, string>[] = [{}, { authorization: "Bearer forged-token-written-in-words" }];
+    for (const headers of cases) {
+      const viaProxy = await proxy(mcpRequest("POST", headers));
+      const viaRoute = await route.POST(mcpRequest("POST", headers));
+      expect(viaRoute.status).toBe(401);
+      expect(await viaRoute.text()).toBe(await viaProxy.text());
+      expect(viaRoute.headers.get("www-authenticate")).toBe(viaProxy.headers.get("www-authenticate"));
+    }
+  });
+
+  test("its bearer refusals write the same permission_denied lines as the proxy's", async () => {
+    const spy = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      await route.POST(mcpRequest("POST", { authorization: "Bearer forged-token-written-in-words" }));
+      restoreChannel();
+      restoreChannel = useMcpChannel({ label: null });
+      await route.GET(mcpRequest("GET", { authorization: "Bearer any-bearer-written-in-words" }));
+      expect(permissionDeniedLines(spy).map((line) => [line.actor, line.reason, line.route])).toEqual([
+        ["anonymous", "mcp_token_invalid", "POST /api/mcp"],
+        ["anonymous", "mcp_channel_unconfigured", "GET /api/mcp"],
+      ]);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  test("a verifier fault answers 500 server_error, logs once and writes no line", async () => {
+    const env = process.env as Record<string, string | undefined>;
+    const secret = env.JWT_SECRET;
+    const mode = env.NODE_ENV;
+    delete env.JWT_SECRET;
+    env.NODE_ENV = "production";
+    const spy = spyOn(console, "log").mockImplementation(() => {});
+    const errorLog = spyOn(logger, "error").mockImplementation(() => {});
+    try {
+      const response = await route.POST(mcpRequest("POST", { authorization: "Bearer any-bearer-written-in-words" }));
+      expect(response.status).toBe(500);
+      expect(await response.json()).toEqual({ error: "server_error", error_description: "Internal Server Error" });
+      expect(errorLog).toHaveBeenCalledTimes(1);
+      expect(permissionDeniedLines(spy)).toEqual([]);
+    } finally {
+      spy.mockRestore();
+      errorLog.mockRestore();
+      env.JWT_SECRET = secret;
+      env.NODE_ENV = mode;
+    }
+  });
+
+  test("imports and calls neither session reader, so no cookie is read on this path", () => {
+    const source = readFileSync(join(ROOT, "src/app/api/mcp/route.ts"), "utf8");
+    for (const name of ["guardRoute", "getSession"]) {
+      expect(source).not.toMatch(new RegExp(`import[^;]*\\b${name}\\b`));
+      expect(source).not.toMatch(new RegExp(`\\b${name}\\s*\\(`));
+    }
+    // The control: the scan reads the route it names.
+    expect(source).toContain("authenticateMcpRequest(");
+  });
+});
+
+describe("a DELETE with a valid bearer and a JSON content type", () => {
+  test("passes proxy(), which alone never answers 405, and the route then answers the SDK's 405 with Allow: POST", async () => {
+    const headers = { authorization: `Bearer ${await mintTestToken()}` };
+    const viaProxy = await proxy(mcpRequest("DELETE", headers));
+    expect(viaProxy.headers.get("x-middleware-next")).toBe("1");
+    const viaRoute = await route.DELETE(mcpRequest("DELETE", headers));
+    expect(viaRoute.status).toBe(405);
+    expect(viaRoute.headers.get("allow")).toBe("POST");
+    expect(await viaRoute.json()).toEqual({
+      jsonrpc: "2.0",
+      error: { code: -32000, message: "Method not allowed." },
+      id: null,
+    });
+  });
+});
+
+describe("at the route, the kill switch is read after identity", () => {
+  const methods = ["POST", "GET", "DELETE"] as const;
+
+  async function call(method: (typeof methods)[number], token: string): Promise<Response> {
+    return routeServe(route)(mcpRequest(method, { authorization: `Bearer ${token}` }));
+  }
+
+  test("unset answers a valid token's POST, GET and DELETE with 404 and a plain error object", async () => {
+    restoreChannel();
+    restoreChannel = useMcpChannel({ enabled: null });
+    const token = await mintTestToken();
+    for (const method of methods) {
+      const response = await call(method, token);
+      expect(response.status).toBe(404);
+      expect(await response.json()).toEqual({ error: "MCP is not enabled on this server" });
+    }
+  });
+
+  test.each(["true", "on", "1", " TRUE ", "On"])("%p serves: the SDK answers the GET", async (value) => {
+    restoreChannel();
+    restoreChannel = useMcpChannel({ enabled: value });
+    expect((await call("GET", await mintTestToken())).status).toBe(405);
+  });
+
+  test.each(["false", "off", "0", "", "   "])("%p answers 404", async (value) => {
+    restoreChannel();
+    restoreChannel = useMcpChannel({ enabled: value });
+    expect((await call("GET", await mintTestToken())).status).toBe(404);
+  });
+
+  test("yes answers every method with 500 naming the variable, never the value, logged once", async () => {
+    restoreChannel();
+    restoreChannel = useMcpChannel({ enabled: "yes" });
+    const errorLog = spyOn(logger, "error").mockImplementation(() => {});
+    try {
+      const token = await mintTestToken();
+      for (const method of methods) {
+        const response = await call(method, token);
+        expect(response.status).toBe(500);
+        const body = await response.text();
+        expect(JSON.parse(body)).toEqual({ error: MCP_ENABLED_INVALID_MESSAGE });
+        expect(body).not.toContain("yes");
+      }
+      expect(errorLog).toHaveBeenCalledTimes(1);
+    } finally {
+      errorLog.mockRestore();
+    }
+  });
+
+  test("a request without a token gets 401 whatever the switch says", async () => {
+    // The switch alone changes between iterations; afterEach restores it with the channel.
+    for (const enabled of [null, "off", "maybe", "true"]) {
+      if (enabled === null) delete process.env[MCP_ENABLED_ENV];
+      else process.env[MCP_ENABLED_ENV] = enabled;
+      expect((await route.POST(mcpRequest("POST"))).status).toBe(401);
+    }
+  });
+
+  test("a change between two calls changes the answer", async () => {
+    const token = await mintTestToken();
+    restoreChannel();
+    restoreChannel = useMcpChannel({ enabled: "true" });
+    expect((await call("GET", token)).status).toBe(405);
+    restoreChannel();
+    restoreChannel = useMcpChannel({ enabled: "off" });
+    expect((await call("GET", token)).status).toBe(404);
+  });
+});
+
+describe("no identity, no work", () => {
+  const dir = mkdtempSync(join(tmpdir(), "libredb-mcp-auth-"));
+
+  beforeEach(() => {
+    createSqliteFile(join(dir, "shop.db"), ["CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY)"]);
+    writeSeedFile(dir, [{ id: "shop", type: "sqlite", database: join(dir, "shop.db") }]);
+  });
+
+  afterEach(async () => {
+    await resetMcpTestState();
+  });
+
+  afterAll(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test.each([
+    ["on", "true"],
+    ["off", "off"],
+  ])("with MCP %s, no refused identity constructs a provider through proxy() or the route", async (_state, enabled) => {
+    restoreChannel();
+    restoreChannel = useMcpChannel({ enabled });
+    const cookie = await signJWT({ username: "alice", role: "admin" });
+    const connects = countMethod(SQLiteProvider.prototype, "connect");
+    try {
+      const refused: Record<string, string>[] = [
+        {},
+        { authorization: "Bearer forged-token-written-in-words" },
+        { cookie: `auth-token=${cookie}` },
+      ];
+      for (const headers of refused) {
+        expect((await proxy(runQueryRequest(headers))).status).toBe(401);
+        expect((await route.POST(runQueryRequest(headers))).status).toBe(401);
+      }
+      expect(connects.calls).toBe(0);
+    } finally {
+      connects.restore();
+    }
+  });
+
+  test("the control: with MCP on, a valid token constructs one, so the count above can fail", async () => {
+    const connects = countMethod(SQLiteProvider.prototype, "connect");
+    try {
+      await readJsonRpc(await route.POST(runQueryRequest({ authorization: `Bearer ${await mintTestToken()}` })));
+      expect(connects.calls).toBe(1);
+    } finally {
+      connects.restore();
+    }
+  });
+});
+
+describe("phase 1 serves no protected resource metadata", () => {
+  test("no route exists under src/app/.well-known/, and the matcher leaves both metadata paths to Next.js's 404", () => {
+    expect(existsSync(join(ROOT, "src/app/.well-known"))).toBe(false);
+    const matcher = new RegExp(`^${config.matcher[0]}$`);
+    expect(matcher.test("/.well-known/oauth-protected-resource")).toBe(false);
+    expect(matcher.test("/.well-known/oauth-protected-resource/api/mcp")).toBe(false);
+    // The control: the same matcher routes the endpoint itself.
+    expect(matcher.test("/api/mcp")).toBe(true);
+  });
+
+  test("the 401 challenge names no resource metadata document", async () => {
+    const challenge = (await proxy(mcpRequest("POST"))).headers.get("www-authenticate");
+    expect(challenge).toContain('scope="mcp:read"');
+    expect(challenge).not.toContain("resource_metadata");
   });
 });
