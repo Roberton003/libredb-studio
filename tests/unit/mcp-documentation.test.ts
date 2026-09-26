@@ -85,6 +85,12 @@ describe("docs/MCP.md", () => {
     expect(MCP_DOC).toContain("| Engine | The client closes the request | `timeout_ms` passes |");
   });
 
+  test("says an MCP call on a LibreDB file keeps the Studio editor out until its handle is idle for 30 minutes", () => {
+    expect(MCP_DOC).toContain(
+      "- An MCP call on a LibreDB connection that no Studio session holds open opens the file itself and keeps its exclusive lock until that handle has been idle for 30 minutes.",
+    );
+  });
+
   test("says a static Authorization header is required, because phase 1 serves no OAuth metadata", () => {
     expect(MCP_DOC).toContain("a client needs its `Authorization` header configured");
   });

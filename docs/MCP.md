@@ -246,6 +246,9 @@ Do not commit a settings file that holds a token.
 | SQLite | The driver is synchronous, so the whole Studio process, the UI included, waits until the statement ends | The client is answered after the statement ends |
 
 - One MCP query against a large SQLite table stops the Studio process while it runs.
+- An MCP call on a LibreDB connection that no Studio session holds open opens the file itself and keeps its exclusive lock until that handle has been idle for 30 minutes.
+  Every MCP call resets that clock, and meanwhile opening the connection in the Studio editor fails with 503, `LibreDB file is already open by another process (exclusive lock)`.
+  When the editor opened the file first, MCP borrows its handle and nothing conflicts ([`docs/providers/libredb.md`](providers/libredb.md#421-on-disk-format-locking-and-version-compatibility-02x)).
 - Every request's `Origin` is checked, and on a loopback bind (`HOSTNAME` of 127.0.0.1, ::1 or localhost) its `Host` too; a container binds every address, so there the Origin check and the token protect the endpoint.
 - JSON-RPC batches are refused: a request body that is a JSON array gets 400 and `-32600`.
 - A client must send `MCP-Protocol-Version` on every request after `initialize`; a request without it gets 400 and `-32020`.
