@@ -79,6 +79,12 @@ describe("docs/MCP.md", () => {
     expect(MCP_DOC).not.toMatch(/eyJ[A-Za-z0-9_-]{10,}/);
   });
 
+  test("says a 2025 client's notifications/cancelled is ignored, and cancels only by closing the request", () => {
+    expect(MCP_DOC).toContain("Studio honours a cancel only when the client closes the request.");
+    expect(MCP_DOC).toContain("`notifications/cancelled`, sent in a `POST` of its own, gets 202 and is ignored");
+    expect(MCP_DOC).toContain("| Engine | The client closes the request | `timeout_ms` passes |");
+  });
+
   test("says a static Authorization header is required, because phase 1 serves no OAuth metadata", () => {
     expect(MCP_DOC).toContain("a client needs its `Authorization` header configured");
   });

@@ -233,9 +233,12 @@ Do not commit a settings file that holds a token.
 - A query with its own `LIMIT` or `TOP`, and `VALUES`, `TABLE` or `EXPLAIN`, cannot be paged with `offset`; the answer says how to page it in SQL.
 - `inspect_schema` and `list_connections` fit each page to 32 KiB, and `has_more` and `next_offset` say where the next page starts.
 - Every `POST` spends one slot of the same per-user budget the database routes use (`RATE_LIMIT_QUERY_MAX`, 120 a minute by default), so a session and an MCP token of one person share it.
+- Studio honours a cancel only when the client closes the request.
+  A 2026-07-28 client does that on every cancel, and a 2025 client only by disconnecting.
+  A 2025 client's `notifications/cancelled`, sent in a `POST` of its own, gets 202 and is ignored, because each `POST` is answered by a server that keeps no session and does not know the call it names: the call runs to completion or `timeout_ms`, answers on the request that is still open, and is audited that way, never as cancelled.
 - A cancel or a timeout ends the wait, not the statement:
 
-| Engine | The client cancels | `timeout_ms` passes |
+| Engine | The client closes the request | `timeout_ms` passes |
 |---|---|---|
 | PostgreSQL | Studio stops waiting; the statement runs on until `statement_timeout`, which is set to the time left | The database ends the statement, and the client gets the timeout answer |
 | SQL Server | Studio stops waiting; the statement runs until the provider's deadline cancels it | The provider cancels the statement, and the client gets the timeout answer |
