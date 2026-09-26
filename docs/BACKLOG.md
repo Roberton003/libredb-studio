@@ -31,7 +31,7 @@ None of it is a GitHub issue.
 - [Drivers and connections](#drivers-and-connections) — D1–D122, U17 · 67
 - [Value interpolation](#value-interpolation) — V1
 - [Row editing](#row-editing) — R1–R3 · 3
-- [Studio UI and query execution](#studio-ui-and-query-execution) — X2–X19, U2–U49 · 37
+- [Studio UI and query execution](#studio-ui-and-query-execution) — X2–X19, U2–U51 · 39
 - [Dependencies](#dependencies) — P1–P5 · 5
 - [Documentation](#documentation) — DOC3–DOC7 · 4
 - [Release pipeline](#release-pipeline) — REL1–REL4 · 4
@@ -1474,7 +1474,7 @@ checker rather than two copies of it.
 
 `CTE_PK_INFO` and `CTE_FK_INFO` in `src/lib/db/providers/sql/postgres.ts` read
 `information_schema.table_constraints`, which PostgreSQL defines as showing only constraints on
-tables a currently enabled role owns.
+tables the current user owns or holds some privilege other than `SELECT` on.
 A connection made as an ordinary `SELECT`-only role therefore sees every column and every index and
 NO key at all, and the answer is a claim rather than an absence: `describeObject` returns
 `isPrimary: false` on every column and `foreignKeys: []`.
@@ -1486,6 +1486,8 @@ and the bulk statement beside it, so the ER diagram, the mobile schema explorer 
 `includeColumns` answer have carried it too.
 What the object tree changed is that the key mark is now on screen, where an absent key reads as a
 table without one.
+The MCP server's `inspect_schema` (#246) carries it as well, and there it is not a corner case either: `docs/MCP.md` requires a least-privilege principal, and `src/lib/mcp/tools/inspect-schema.ts` copies `column.isPrimary` into `is_primary_key`.
+Measured 2026-09-26 in the PR #1070 live check: as a `SELECT`-only `mcp_reader`, `inspect_schema` with `include_indexes: true` answered `is_primary_key: false` for `mcp_events.id` while listing `mcp_events_pkey` among its indexes, and `information_schema.table_constraints` answered 0 primary keys for `mcp_events` to that role and 1 to `postgres`.
 
 Measured 2026-09-22 against PostgreSQL 18 holding `dvdrental`, `public.film`, tables owned by
 `postgres`, probed through `POST /api/db/objects/describe`:
@@ -2752,6 +2754,37 @@ Found 2026-09-24 by the #1113 review.
 Not fixed in #1113: the fixed width before it was cut at that setting too, so this is not a regression of that change.
 
 **Done when:** the header width follows the root font size, either by scaling the result or by stating the constants in rem, and a test at a 20px root pins a name that is shown whole.
+
+### U50. The development server's built-in MCP endpoint answers without a session
+
+`next dev` serves its own MCP endpoint at `/_next/mcp`, and `src/proxy.ts` lets every path that starts with `/_next` through without a session.
+With `bun dev` bound beyond loopback, that endpoint answers anyone who can reach the port.
+Measured 2026-09-26 on Next.js 16.3.5 in the PR #1070 live check: with `HOSTNAME=0.0.0.0 PORT=3100 bun dev --hostname 0.0.0.0 --port 3100`, a `POST /_next/mcp` from the LAN address with no cookie answered `initialize`, `tools/list` and `tools/call` for `get_project_metadata` with 200, and the last one returned the absolute project path.
+Only a request carrying a foreign `Origin` was refused, with 403.
+The production build does not serve the endpoint; `/api/mcp`, Studio's own MCP server, is a different route and was not involved.
+
+Repro: `HOSTNAME=0.0.0.0 PORT=3100 bun dev --hostname 0.0.0.0 --port 3100`, then from another host `curl -X POST http://<lan-ip>:3100/_next/mcp -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -H 'MCP-Protocol-Version: 2025-06-18' -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_project_metadata","arguments":{}}}'`.
+
+Found 2026-09-26 by the PR #1070 live check.
+Not fixed in #1070: the endpoint is the framework's, and whether to gate it in the proxy or to document it is a decision about the dev server, not about Studio's MCP server.
+
+**Done when:** the endpoint is unreachable without a session on a development server bound beyond loopback, or the development docs state the exposure where a contributor meets it.
+
+### U51. The agent rail keeps a pending start, and the last run, from the connection before a switch
+
+Two cases, both reproduced in a browser in the PR #1070 live check on 2026-09-26.
+
+- **The consent step outlives a connection switch.** Select Live SQLite, choose Agent mode, type an objective and press Start, so the step reads "This run will open as Analyze on Live SQLite". Click Live PostgreSQL in the sidebar: the rail header changes to "on Live PostgreSQL" and the step stays. Pressing "Start run" opens the run on `seed:live-sqlite`.
+- **The previous connection's last run stays on screen.** Run plan mode on Live DuckDB, then click Live SQLite. The rail says "on Live SQLite" and "Connection changed, so this question started a new conversation", and still shows the DuckDB run and its outcome.
+
+Nothing runs in the wrong place: `ConsentCard` is bound to the snapshot on purpose (`src/components/agent/ConsentCard.tsx`, the `connectionName` docblock), so its sentence names the connection the run opens on.
+The defect is that the rail then shows two different connections at once, and a user who reads the header rather than the step starts a run somewhere else than they think.
+`pendingStart` in `src/components/agent/AgentRail.tsx` is not cleared when the shell's connection changes.
+
+Found 2026-09-26 by the PR #1070 live check.
+Not fixed in #1070: the PR does not touch the agent rail.
+
+**Done when:** a connection switch either closes the consent step or keeps it with the rail header naming the step's connection, the rail stops showing the previous connection's run after the switch, and a component test pins both across a connection change.
 
 ## Dependencies
 
