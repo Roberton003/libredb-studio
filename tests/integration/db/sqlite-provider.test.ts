@@ -4498,6 +4498,12 @@ const MISSING_UNWRITABLE_FILE: string | null =
  * the directory. Written with the driver directly rather than through the provider, because
  * the provider leaves a file in WAL mode, and that is its own fixture (see "a WAL-mode file"
  * below).
+ *
+ * A WAL fixture is the file alone, with no `-wal` or `-shm` beside it. Closing removes both
+ * on Linux and Windows but not on macOS, where bun:sqlite links Apple's libsqlite3, which
+ * keeps them (docs/providers/sqlite.md §3.2); with them left in place the read-only open
+ * succeeded on the macos-latest runner (2026-09-26). So the checkpoint moves every row into
+ * the file, and the sidecars go by hand.
  */
 function writeUnwritableFixture(dir: string, journalMode: "delete" | "wal"): string {
   mkdirSync(dir, { recursive: true });
@@ -4506,7 +4512,10 @@ function writeUnwritableFixture(dir: string, journalMode: "delete" | "wal"): str
   db.exec(`PRAGMA journal_mode = ${journalMode}`);
   db.exec("CREATE TABLE orders (id INTEGER PRIMARY KEY, customer TEXT NOT NULL, total REAL)");
   db.exec("INSERT INTO orders VALUES (1, 'ada', 10.5), (2, 'bob', 20), (3, 'cy', 30.25)");
+  if (journalMode === "wal") db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
   db.close(true);
+  rmSync(`${file}-wal`, { force: true });
+  rmSync(`${file}-shm`, { force: true });
   chmodSync(file, 0o444);
   chmodSync(dir, 0o555);
   return file;

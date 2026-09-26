@@ -1222,9 +1222,10 @@ export class SQLiteProvider extends SQLBaseProvider {
    * refusal. `query_only` is NOT set: this is the editor, and the file's permissions
    * are the boundary, not a profile.
    *
-   * A file already in WAL journal mode still cannot be opened when its directory is
-   * unwritable: SQLite reads one only with a `-shm` file beside it (measured on
-   * bun:sqlite and node:sqlite, 2026-09-26). `connect()` names that case.
+   * A file already in WAL journal mode, with no `-shm` file beside it, still cannot be
+   * opened when its directory is unwritable: SQLite reads one only with a `-shm` file
+   * beside it, and has nowhere to make one (measured on bun:sqlite and node:sqlite,
+   * 2026-09-26). `connect()` names that case.
    */
   private connectUnwritableFile(SQLiteDB: Awaited<ReturnType<typeof loadSQLiteDriver>>, dbPath: string): void {
     this.unwritableFilePath = dbPath;
