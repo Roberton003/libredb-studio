@@ -93,7 +93,7 @@ export function StudioDesktopHeader({
         {user && (
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
-              <Button variant="ghost" size="sm" className="h-8 gap-2 hover:bg-fill px-2">
+              <Button variant="ghost" size="sm" className="h-8 gap-2 hover:bg-fill px-2" aria-label="User menu">
                 <User strokeWidth={1.5} className="w-3 h-3 text-brand" />
               </Button>
             </DropdownMenuTrigger>
