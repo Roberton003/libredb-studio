@@ -28,7 +28,7 @@ None of it is a GitHub issue.
 **Sections**
 
 - [SQL statement reading](#sql-statement-reading) — S2–S6 · 4
-- [Drivers and connections](#drivers-and-connections) — D1–D119, U17 · 64
+- [Drivers and connections](#drivers-and-connections) — D1–D122, U17 · 67
 - [Value interpolation](#value-interpolation) — V1
 - [Row editing](#row-editing) — R1–R3 · 3
 - [Studio UI and query execution](#studio-ui-and-query-execution) — X2–X19, U2–U49 · 37
@@ -42,6 +42,7 @@ None of it is a GitHub issue.
 - [Security scanner triage](#security-scanner-triage) — SCAN1 · 1
 - [Agent M1 deferrals (#328)](#agent-m1-deferrals-328) — A1–A8 · 7
 - [Agent M2 deferrals (#329)](#agent-m2-deferrals-329) — B2–B88 · 29
+- [MCP server deferrals (#246)](#mcp-server-deferrals-246)
 
 ---
 
@@ -1834,6 +1835,31 @@ A primary key column is not nullable by definition, so that half needs no catalo
 
 **Done when:** on RisingWave a `NOT NULL` column and a primary key column both read as not nullable, every other engine reads the same nullability as before, measured live, and a test pins both halves.
 
+### D120. Concurrent first acquisitions of one connection and profile each open a provider
+
+`acquireExecutionProfileProvider` (`src/lib/db/factory.ts:715-812`) checks the profiled cache, and on a miss constructs and connects a provider, then stores it (`:809`).
+Two callers that miss at the same time each construct one, and the later store overwrites the earlier entry, so the earlier provider stays connected with nothing left to close it.
+The editor and agent paths reach this function the same way.
+`/api/mcp` avoids it on its own side, with an in-flight map keyed on the exported `profiledCacheKey` (`src/lib/mcp/context.ts`).
+
+**Done when:** the factory deduplicates in-flight acquisitions itself, MCP's own map is removed, and a test pins that N concurrent first acquisitions construct one provider.
+
+### D121. Two seed-loading paths drop a connection without telling the caller
+
+`resolveAllCredentials` skips a seed whose credentials fail to resolve and only logs it (`src/lib/seed/credential-resolver.ts:89-99`).
+The built-in samples are left out on a filesystem error by an empty `catch` (`src/lib/seed/index.ts:57-59`, `:68-70`).
+Both reach the caller as a shorter list with no reason: `GET /api/connections/managed` and MCP's `list_connections` show fewer connections and say nothing.
+
+**Done when:** each failure reaches the caller as a named reason, in the shape of `SEED_CONFIG_UNREADABLE_REASON` (`src/app/api/connections/managed/route.ts:17-33`), or a recorded decision says why a partial list is the right answer.
+
+### D122. A read-only statement cannot be cancelled, so a cancelled or timed-out MCP query keeps running
+
+`queryReadOnly` takes no signal (`src/lib/db/types.ts:951`), and `cancelQuery` cannot find its statement.
+When an MCP client cancels or `timeout_ms` passes, `run_read_query` stops waiting but the statement runs on: on PostgreSQL until `statement_timeout`, on SQL Server until the provider's deadline, on DuckDB to completion, and on SQLite while blocking the process (A1).
+This departs from the MCP rule that a server should stop work on a cancelled request as soon as practical.
+
+**Done when:** `queryReadOnly` accepts an `AbortSignal`, each of the four providers stops the statement on abort, their provider docs say so, and `/api/mcp` passes the tool call's signal.
+
 ## Value interpolation
 
 ### V1. Query history records the placeholders, not the values that were bound
@@ -3350,10 +3376,6 @@ Two things keep it open rather than settled.
 The CodeQL check reports SUCCESS because alerts do not fail the job, so a green rollup hides this.
 And the code does not exist on `main`: it arrives only if #1070 merges, and a dismissal must be made against the merged location.
 
-Related and separate: the test that claims to cover this (`tests/unit/mcp/serializer.test.ts:104`) cannot fail for the flagged branch, because its payload has no `://` and so never reaches the `[^/\s]+@` quantifier.
-A catastrophic variant of the same rule measured 0.06 ms on that payload, inside its 100 ms budget, and 653 ms on `"http://"` plus 37 characters.
-That one is the contributor's to fix and was raised on #1070.
-
 **Done when:** alert 536 carries a written ruling, either dismissed as a false positive with the reason recorded, or the expression narrowed so the alert closes on its own.
 
 ---
@@ -3362,7 +3384,7 @@ That one is the contributor's to fix and was raised on #1070.
 
 Each was decided while building the operation/policy layer, not overlooked.
 
-### A1. A SQLite agent statement can block the runtime for its whole duration
+### A1. A SQLite agent or MCP statement can block the runtime for its whole duration
 
 `sqlite.ts`'s `queryReadOnly` enforces `statementTimeoutMs` as a post-execution deadline: the result of
 an overrunning statement is refused, but the statement is never preempted. SQLite has no
@@ -3373,8 +3395,9 @@ Because both drivers are synchronous, a hostile recursive CTE blocks the whole r
 Same property as the normal SQLite query path, but the input source differs in kind: there the SQL
 comes from an authenticated operator, here from an agent.
 
-**Done when:** either driver exposes an interrupt/progress hook, or agent SQLite execution moves to a
-worker that can be killed on deadline.
+`/api/mcp`'s `run_read_query` reaches the same path, `queryReadOnly` under `agent-read-only`, with SQL from an external MCP client, and `docs/MCP.md` states the risk.
+
+**Done when:** either driver exposes an interrupt or progress hook, or agent and MCP SQLite execution moves to a worker that can be killed on deadline.
 
 ### A2. `VACUUM INTO` can create an empty file at an agent-chosen path
 
@@ -4126,3 +4149,24 @@ Found 2026-09-24 while checking the VictoriaMetrics relative after #1104.
 Not fixed there: both rules of the walk are documented decisions (the `walkObjectInventory` docblock), so changing either is a ruling rather than a fix.
 
 **Done when:** a ruling chooses between recording a refused kind in the inventory, with the engine's sentence, while keeping the kinds that were read, and keeping the whole-capture refusal with a message that names the refused kind rather than an unreachable server; and a test drives the walk over a provider whose one kind's listing throws.
+
+---
+
+## MCP server deferrals (#246)
+
+Each was decided when PR #1070's MCP server was redesigned, not overlooked.
+
+### MCP1. MCP clients authenticate with a static bearer token, not OAuth
+
+Phase 1 of `/api/mcp` accepts only a bearer token that Studio mints for one user (`src/lib/mcp/token.ts`).
+The MCP authorization specification is optional, but an HTTP implementation that supports authorization should follow it, and a hosted client such as claude.ai or ChatGPT needs OAuth to act for one person.
+No protected resource metadata document is served, because one without an authorization server is non-conformant.
+
+Two tests belong to this work and are written first:
+
+- The metadata document's `resource` equals the canonical MCP URL, `basePath` included, and its `authorization_servers` is not empty.
+- The `resource_metadata` in the 401 challenge points at the document that is served.
+
+Under a `basePath`, the root `/.well-known/` path cannot be served by a route inside the app; a redirect, a rewrite to an absolute URL or a proxy in front can serve it, and a live test pins the one chosen.
+
+**Done when:** an authorization server issues tokens audience-bound to the canonical MCP URL, `/api/mcp` validates them, the metadata document and the challenge pointer exist, and the two tests above pass.

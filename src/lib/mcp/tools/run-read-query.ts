@@ -57,7 +57,7 @@ import {
  * factory refuses to hand out for an engine without one; this module never calls query(), and that
  * is what makes its readOnlyHint true. The execution fence runs first as defence in depth. One
  * deadline, the call's start plus timeout_ms, covers acquisition and execution; neither a cancel
- * nor the deadline stops a statement already running, they end the wait.
+ * nor the deadline stops a statement already running (docs/BACKLOG.md D122), they end the wait.
  *
  * Rows are fetched one past the page, so the extra row proves more exist, cut to max_rows, then
  * cut to the result cap by binary search. offset on a query the provider did not rewrite is

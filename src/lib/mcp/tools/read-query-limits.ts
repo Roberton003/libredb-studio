@@ -10,7 +10,7 @@ import type { DatabaseType } from "@/lib/types";
  * fall through to an engine error. A time-budget refusal, and any failure that settles once the
  * deadline has passed, is the timeout, so which of the two settles first never changes what the
  * client reads. The deadline race stops the wait for a statement, not the statement: no provider
- * can cancel a read-only statement yet.
+ * can cancel a read-only statement yet (docs/BACKLOG.md D122).
  */
 
 export type ReadOnlyRefusalKind = "rows" | "bytes" | "cut-value" | "serialised" | "time";

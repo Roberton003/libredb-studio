@@ -1,45 +1,261 @@
-# MCP
+# MCP server
 
-LibreDB Studio exposes a native HTTP JSON-RPC MCP endpoint.
+LibreDB Studio serves the [Model Context Protocol](https://modelcontextprotocol.io) at `/api/mcp`.
+An AI client of your own, such as Claude Code, Codex, Cursor, VS Code or Gemini CLI, reads the schemas of the connections an operator opted in and runs bounded, read-only SQL through Studio, while the database credentials stay on the server.
+It is off by default.
 
-## Endpoint
+## What it is
 
-Use the `/api/mcp` path on your deployment:
+- One endpoint, `POST /api/mcp`, served by the official MCP TypeScript SDK.
+  It speaks revision 2026-07-28 and, without sessions, the 2025 revisions 2025-11-25 and 2025-06-18 that most clients still use.
+- Three tools, each annotated read-only and closed-world:
+  - `list_connections` lists the connections opted in for MCP that your token's role may use, without credentials.
+    It works for every engine.
+  - `inspect_schema` lists one connection's tables with their columns and, on request, their indexes.
+    It works on every engine.
+  - `run_read_query` runs one read-only statement: a `SELECT` (a `WITH` is fine), `VALUES`, `TABLE`, or `EXPLAIN` without `ANALYZE`.
+    Runs on PostgreSQL, SQLite, DuckDB and SQL Server; other engines refuse it, so use inspect_schema there.
+- Read-only is the database's own enforcement, not a filter over SQL text: `run_read_query` takes the connection under Studio's agent read-only execution profile and runs through the provider's read-only statement path, which PostgreSQL enforces with a read-only transaction, SQLite and DuckDB with a read-only open, and SQL Server by verifying the principal cannot write.
+  A statement check runs first as defence in depth.
+- A result that carries database content starts with a text block telling the model to treat what follows as untrusted data.
 
-```text
-https://<your-libredb-studio-host>/api/mcp
+## Enabling it
+
+Four variables decide it, and `.env.example` documents each.
+
+| Variable | What it sets |
+|---|---|
+| `LIBREDB_MCP_ENABLED` | `true`, `on` or `1` enable MCP; `false`, `off`, `0`, empty or unset leave it off; any other value is an error on every authenticated request |
+| `LIBREDB_MCP_URL` | The address clients use, which every token is bound to: an absolute http(s) URL ending in `/api/mcp`, with your `BASE_PATH`, and no user name, password, query or fragment |
+| `LIBREDB_MCP_TOKEN_LABEL` | Any non-empty value; changing it revokes every MCP token at once |
+| `LIBREDB_MCP_TOKEN_TTL_DAYS` | How many days a minted token stays valid, from 1 to 365, 30 when unset |
+
+### npx
+
+The launcher derives `LIBREDB_MCP_URL` from the address and port it serves on, so only the switch and the label are yours:
+
+```bash
+LIBREDB_MCP_ENABLED=true LIBREDB_MCP_TOKEN_LABEL=studio-mcp-1 npx @libredb/studio
 ```
 
-The endpoint requires an authenticated LibreDB Studio session. There is no separate MCP token and no STDIO server. Never commit session cookies or other credentials.
+The derived address is `http://127.0.0.1:3000/api/mcp` unless `--host` or `--port` says otherwise, and changing either invalidates every token minted for the old address.
+Set `LIBREDB_MCP_URL` yourself when clients reach Studio through another address, such as a reverse proxy.
 
-## Available tools
+### Docker and Compose
 
-- `list_connections` — list available connections without exposing credentials.
-- `inspect_schema` — inspect schemas, tables, columns, and indexes.
-- `run_read_query` — execute a read-only `SELECT` or `WITH` query subject to row, payload, and timeout limits.
+Add the three settings to the container's environment:
 
-Engine profile restrictions are enforced. If an engine refuses the requested read-only or operations profile, the refusal is returned to the MCP client; Studio does not silently switch to a writable provider.
+```bash
+docker run -p 3000:3000 \
+  -e LIBREDB_MCP_ENABLED=true \
+  -e LIBREDB_MCP_URL=https://studio.example.com/api/mcp \
+  -e LIBREDB_MCP_TOKEN_LABEL=studio-mcp-1 \
+  ghcr.io/libredb/libredb-studio:latest
+```
 
-## Cursor
+In `docker-compose.example.yml`, uncomment the four `LIBREDB_MCP_*` lines beside the agent flag.
 
-Add LibreDB Studio as an HTTP MCP server using the configuration format supported by your installed Cursor version. Set the server URL to the endpoint above and use Cursor's documented secure authentication/session mechanism. Consult the current Cursor MCP documentation for exact keys and authentication behavior: <https://docs.cursor.com/context/mcp>.
+### Helm
 
-## Claude Code
+```bash
+helm upgrade libredb libredb/libredb-studio --reuse-values \
+  --set mcp.enabled=true \
+  --set mcp.url=https://studio.example.com/api/mcp \
+  --set mcp.tokenLabel=studio-mcp-1
+```
 
-Add the endpoint as an HTTP MCP server using the configuration format supported by your installed version. Use the endpoint URL above and the documented secure session mechanism. Do not place a LibreDB Studio session cookie in a checked-in configuration file. Consult the current Claude Code MCP documentation for exact configuration details.
+An enabled `mcp` block without `mcp.url` or `mcp.tokenLabel` refuses to render and names the value.
 
-## OpenCode
+### Other channels
 
-Add the endpoint as a remote HTTP MCP server using the configuration format supported by your installed version. Use the endpoint URL above and OpenCode's documented secure authentication mechanism. Consult the current OpenCode MCP documentation for exact configuration details.
+The native packages and every other way of running `server.js` derive nothing: set all three yourself.
 
-## Security and troubleshooting
+## Opting connections in
 
-- Use HTTPS in production and restrict network access to trusted clients.
-- Use a least-privilege Studio account.
-- Never commit cookies, bearer credentials, or generated client configuration containing secrets.
-- Unauthenticated requests through Studio reverse proxy/middleware receive an HTTP 307 redirect to `/login`.
-- `429` indicates the query rate limit bucket was reached.
-- Batch requests are supported up to 50 requests per batch with a 64 KiB wire budget. If a batch exceeds the budget, overflowing responses are returned with per-ID JSON-RPC errors rather than silently dropped.
-- The `offset` parameter in `run_read_query` is supported when the underlying provider declares pagination support (`supportsResultPagination`). A positive offset on an unsupported provider returns an error. Deterministic ordering (`ORDER BY`) is recommended for stable pagination.
-- Engine operations write structured audit events (`type: agent_operation`) with duration and user identity without exposing query text or credential secrets.
-- A JSON-RPC error generally indicates an invalid request, invalid parameters, unsupported method, or engine refusal.
+An MCP client reaches a connection only when its seed entry says `mcp: true`, and only when the connection's `roles` admit the role your token carries ([`docs/SEED_CONNECTIONS.md`](SEED_CONNECTIONS.md)).
+
+```yaml
+connections:
+  - id: shop
+    name: Shop
+    type: postgres
+    host: db.internal
+    database: shop
+    roles: ["*"]
+    mcp: true
+```
+
+The opt-in is per connection, so `defaults.mcp` is refused.
+The built-in sample connections are never visible to an MCP client.
+An empty `list_connections` answer means no connection is opted in for your token's role: an operator adds `mcp: true` to a seed connection.
+
+## Getting a token
+
+Open **MCP** in the user menu, the settings screen at `/settings/mcp`.
+It shows whether MCP is ready on this server, what an operator has to set when it is not, and how many connections your role can reach.
+When it is ready, **Create token** mints one for you and shows it once: copy it then, because it is not shown again and nothing about it is stored.
+
+- A token is valid for `LIBREDB_MCP_TOKEN_TTL_DAYS` days, 30 by default.
+- It carries the role you had when you minted it, so a lowered role keeps working until the token expires or the label changes.
+- Changing `LIBREDB_MCP_TOKEN_LABEL` revokes every MCP token at once, and it is the only revocation there is.
+- Deleting a local user, disabling an OIDC account or changing a password leaves that user's MCP tokens valid until they expire, so removing a person's access means rotating `LIBREDB_MCP_TOKEN_LABEL`.
+- A changed `LIBREDB_MCP_URL`, and under npx a changed `--host` or `--port`, invalidates every token too.
+
+## Client configuration
+
+Every example that reads the token from the environment reads `LIBREDB_MCP_TOKEN`:
+
+```bash
+export LIBREDB_MCP_TOKEN='<your-mcp-token>'
+```
+
+The name is Studio's own on purpose: Claude Code reads a set of well-known credential variables as empty toward a remote server, and a name of your own expands.
+Never commit a token.
+
+### Claude Code
+
+Not verified live.
+
+In `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "libredb": {
+      "type": "http",
+      "url": "https://studio.example.com/api/mcp",
+      "headers": {
+        "Authorization": "Bearer ${LIBREDB_MCP_TOKEN}"
+      }
+    }
+  }
+}
+```
+
+Or from a shell:
+
+```bash
+claude mcp add --transport http libredb https://studio.example.com/api/mcp --header "Authorization: Bearer ${LIBREDB_MCP_TOKEN}"
+```
+
+Claude Code shows a 401 from a server whose `Authorization` header you configured as a failed connection, and it marks a server configured without that header for an OAuth sign-in, which Studio does not offer.
+
+### Codex
+
+Not verified live.
+
+In `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.libredb]
+url = "https://studio.example.com/api/mcp"
+bearer_token_env_var = "LIBREDB_MCP_TOKEN"
+```
+
+### Cursor
+
+Not verified live.
+
+In `.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "libredb": {
+      "url": "https://studio.example.com/api/mcp",
+      "headers": {
+        "Authorization": "Bearer ${env:LIBREDB_MCP_TOKEN}"
+      }
+    }
+  }
+}
+```
+
+### VS Code
+
+Not verified live.
+
+In `.vscode/mcp.json`; VS Code asks for the token once and stores it:
+
+```json
+{
+  "inputs": [
+    {
+      "type": "promptString",
+      "id": "libredb-mcp-token",
+      "description": "LibreDB Studio MCP token",
+      "password": true
+    }
+  ],
+  "servers": {
+    "libredb": {
+      "type": "http",
+      "url": "https://studio.example.com/api/mcp",
+      "headers": {
+        "Authorization": "Bearer ${input:libredb-mcp-token}"
+      }
+    }
+  }
+}
+```
+
+VS Code's Agent Host does not receive servers that need an `${input:...}` value.
+
+### Gemini CLI
+
+Not verified live.
+
+In `~/.gemini/settings.json`; Gemini CLI takes the streaming HTTP address as `httpUrl`, because `url` selects its SSE client, and it takes the token written in:
+
+```json
+{
+  "mcpServers": {
+    "libredb": {
+      "httpUrl": "https://studio.example.com/api/mcp",
+      "headers": {
+        "Authorization": "Bearer <your-mcp-token>"
+      }
+    }
+  }
+}
+```
+
+Or run `gemini mcp add -t http -H "Authorization: Bearer <your-mcp-token>" libredb https://studio.example.com/api/mcp`.
+Do not commit a settings file that holds a token.
+
+## Limits
+
+- Authentication is a static bearer token that Studio mints: there is no OAuth and no protected resource metadata document, so a client needs its `Authorization` header configured.
+- `run_read_query` reads at most 1000 rows and 1 MiB from the database, and answers at most `max_rows` rows (default 100, at most 500) and 32 KiB; `truncated`, `truncated_by`, `pagination.hasMore` and `pagination.nextOffset` say what was cut and where the next page starts.
+- A query with its own `LIMIT` or `TOP`, and `VALUES`, `TABLE` or `EXPLAIN`, cannot be paged with `offset`; the answer says how to page it in SQL.
+- `inspect_schema` and `list_connections` fit each page to 32 KiB, and `has_more` and `next_offset` say where the next page starts.
+- Every `POST` spends one slot of the same per-user budget the database routes use (`RATE_LIMIT_QUERY_MAX`, 120 a minute by default), so a session and an MCP token of one person share it.
+- A cancel or a timeout ends the wait, not the statement:
+
+| Engine | The client cancels | `timeout_ms` passes |
+|---|---|---|
+| PostgreSQL | Studio stops waiting; the statement runs on until `statement_timeout`, which is set to the time left | The database ends the statement, and the client gets the timeout answer |
+| SQL Server | Studio stops waiting; the statement runs until the provider's deadline cancels it | The provider cancels the statement, and the client gets the timeout answer |
+| DuckDB | Studio stops waiting; the statement runs to completion and its result is discarded | The client gets the timeout answer near `timeout_ms`, and the statement runs on |
+| SQLite | The driver is synchronous, so the whole Studio process, the UI included, waits until the statement ends | The client is answered after the statement ends |
+
+- One MCP query against a large SQLite table stops the Studio process while it runs.
+- Every request's `Origin` is checked, and on a loopback bind (`HOSTNAME` of 127.0.0.1, ::1 or localhost) its `Host` too; a container binds every address, so there the Origin check and the token protect the endpoint.
+- JSON-RPC batches are refused: a request body that is a JSON array gets 400 and `-32600`.
+- A client must send `MCP-Protocol-Version` on every request after `initialize`; a request without it gets 400 and `-32020`.
+- `GET` and `DELETE` get 405, and a hand-built `DELETE` with neither an `Origin` nor a JSON content type is refused 403 by Studio's CSRF check first.
+
+## Troubleshooting
+
+| Status | Meaning |
+|---|---|
+| 401 | No `Authorization: Bearer` header, or a token that does not verify: expired, minted before the label changed, or minted for another address (a changed `LIBREDB_MCP_URL`, or under npx a changed `--host` or `--port`); the audit reason says `mcp_token_invalid`, or `mcp_channel_unconfigured` when the label or the URL is unset |
+| 403 | The request's `Origin`, or on a loopback bind its `Host`, is not allowed |
+| 404 | MCP is off on this server; a client that falls back to the older HTTP+SSE transport retries with `GET` and reports a transport error rather than "disabled" |
+| 409 | At minting, the channel is not ready, and the screen lists what to set |
+| 429 | The per-user query budget is spent; retry after `Retry-After` seconds |
+| 400 `-32020` | A required `MCP-Protocol-Version`, `Mcp-Method` or `Mcp-Name` header is missing, malformed or disagrees with the body |
+| 500 | An unrecognized `LIBREDB_MCP_ENABLED`, an unset server version, or a server fault such as a missing `JWT_SECRET`; the server log names which |
+
+Every tool call writes `mcp_operation` audit events: a decision before any database is reached and an outcome after it, under one correlation id, with the token's user and the connection's seed id.
+A call whose audit record cannot be written is not run.
