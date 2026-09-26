@@ -613,6 +613,68 @@ describe("mcpUrlFor (#246)", () => {
   });
 });
 
+describe("resolvePathVariables", () => {
+  const cwd = path.resolve(tempDir, "invoked-from");
+
+  test.each(PATH_VARIABLES.map((name) => [name]))("resolves a relative %s against the invoking directory", (name) => {
+    expect(resolvePathVariables({ [name]: "./data/x" }, cwd)[name]).toBe(path.join(cwd, "data", "x"));
+  });
+
+  test("resolves a bare relative name, not only one starting with ./", () => {
+    expect(resolvePathVariables({ SEED_CONFIG_PATH: "seed.yaml" }, cwd).SEED_CONFIG_PATH).toBe(
+      path.join(cwd, "seed.yaml"),
+    );
+  });
+
+  test("leaves an absolute value untouched", () => {
+    const absolute = path.resolve(os.tmpdir(), "seed.yaml");
+    expect(resolvePathVariables({ SEED_CONFIG_PATH: absolute }, cwd).SEED_CONFIG_PATH).toBe(absolute);
+  });
+
+  test.each([[""], ["   "]])(
+    "leaves an empty value %p untouched, so the server's own default still applies",
+    (value) => {
+      expect(resolvePathVariables({ STORAGE_SQLITE_PATH: value }, cwd).STORAGE_SQLITE_PATH).toBe(value);
+    },
+  );
+
+  test("never resolves a URL path, even a relative-looking one", () => {
+    const env = { BASE_PATH: "tools/libredb", NEXT_PUBLIC_MONACO_VS_PATH: "monaco/vs", SEED_CONFIG_PATH: "s.yaml" };
+    const resolved = resolvePathVariables(env, cwd);
+    expect(resolved.BASE_PATH).toBe("tools/libredb");
+    expect(resolved.NEXT_PUBLIC_MONACO_VS_PATH).toBe("monaco/vs");
+    // The control: the same call did resolve a filesystem path.
+    expect(resolved.SEED_CONFIG_PATH).toBe(path.join(cwd, "s.yaml"));
+  });
+
+  test("copies every other variable through and does not mutate its input", () => {
+    const env = { SEED_CONFIG_PATH: "s.yaml", JWT_SECRET: "./not-a-path" };
+    const resolved = resolvePathVariables(env, cwd);
+    expect(resolved.JWT_SECRET).toBe("./not-a-path");
+    expect(resolved).not.toHaveProperty("STORAGE_SQLITE_PATH");
+    expect(env.SEED_CONFIG_PATH).toBe("s.yaml");
+  });
+
+  /*
+    The guard that keeps the list honest: a new *_PATH, *_DIR or *_FILE variable documented in
+    .env.example must be classified here, either resolved (PATH_VARIABLES) or left alone with a
+    reason (URL_PATH_VARIABLES), so it cannot silently keep the old cwd-relative behaviour.
+  */
+  test("every *_PATH, *_DIR or *_FILE variable in .env.example is classified", () => {
+    const example = fs.readFileSync(path.resolve(import.meta.dir, "../../.env.example"), "utf8");
+    const documented = [...example.matchAll(/^#?\s*([A-Z][A-Z0-9_]*_(?:PATH|DIR|FILE))=/gm)].map((m) => m[1]);
+    // The control: the pattern does find the variables this fix was written for.
+    expect(documented).toContain("SEED_CONFIG_PATH");
+    expect(documented).toContain("BASE_PATH");
+    const classified = new Set([...PATH_VARIABLES, ...Object.keys(URL_PATH_VARIABLES)]);
+    expect(documented.filter((name) => !classified.has(name))).toEqual([]);
+  });
+
+  test("no variable is both resolved and excluded", () => {
+    expect(PATH_VARIABLES.filter((name) => Object.hasOwn(URL_PATH_VARIABLES, name))).toEqual([]);
+  });
+});
+
 describe("resolveBindAddress (issue #813)", () => {
   /*
     Named rather than numbered, because the rows move: the pair carrying the issue
@@ -696,68 +758,6 @@ describe("resolveBindAddress (issue #813)", () => {
  * @mikevillari in #709 and removed there while that job still ran on the runner's
  * default Node 22.
  */
-describe("resolvePathVariables", () => {
-  const cwd = path.resolve(tempDir, "invoked-from");
-
-  test.each(PATH_VARIABLES.map((name) => [name]))("resolves a relative %s against the invoking directory", (name) => {
-    expect(resolvePathVariables({ [name]: "./data/x" }, cwd)[name]).toBe(path.join(cwd, "data", "x"));
-  });
-
-  test("resolves a bare relative name, not only one starting with ./", () => {
-    expect(resolvePathVariables({ SEED_CONFIG_PATH: "seed.yaml" }, cwd).SEED_CONFIG_PATH).toBe(
-      path.join(cwd, "seed.yaml"),
-    );
-  });
-
-  test("leaves an absolute value untouched", () => {
-    const absolute = path.resolve(os.tmpdir(), "seed.yaml");
-    expect(resolvePathVariables({ SEED_CONFIG_PATH: absolute }, cwd).SEED_CONFIG_PATH).toBe(absolute);
-  });
-
-  test.each([[""], ["   "]])(
-    "leaves an empty value %p untouched, so the server's own default still applies",
-    (value) => {
-      expect(resolvePathVariables({ STORAGE_SQLITE_PATH: value }, cwd).STORAGE_SQLITE_PATH).toBe(value);
-    },
-  );
-
-  test("never resolves a URL path, even a relative-looking one", () => {
-    const env = { BASE_PATH: "tools/libredb", NEXT_PUBLIC_MONACO_VS_PATH: "monaco/vs", SEED_CONFIG_PATH: "s.yaml" };
-    const resolved = resolvePathVariables(env, cwd);
-    expect(resolved.BASE_PATH).toBe("tools/libredb");
-    expect(resolved.NEXT_PUBLIC_MONACO_VS_PATH).toBe("monaco/vs");
-    // The control: the same call did resolve a filesystem path.
-    expect(resolved.SEED_CONFIG_PATH).toBe(path.join(cwd, "s.yaml"));
-  });
-
-  test("copies every other variable through and does not mutate its input", () => {
-    const env = { SEED_CONFIG_PATH: "s.yaml", JWT_SECRET: "./not-a-path" };
-    const resolved = resolvePathVariables(env, cwd);
-    expect(resolved.JWT_SECRET).toBe("./not-a-path");
-    expect(resolved).not.toHaveProperty("STORAGE_SQLITE_PATH");
-    expect(env.SEED_CONFIG_PATH).toBe("s.yaml");
-  });
-
-  /*
-    The guard that keeps the list honest: a new *_PATH, *_DIR or *_FILE variable documented in
-    .env.example must be classified here, either resolved (PATH_VARIABLES) or left alone with a
-    reason (URL_PATH_VARIABLES), so it cannot silently keep the old cwd-relative behaviour.
-  */
-  test("every *_PATH, *_DIR or *_FILE variable in .env.example is classified", () => {
-    const example = fs.readFileSync(path.resolve(import.meta.dir, "../../.env.example"), "utf8");
-    const documented = [...example.matchAll(/^#?\s*([A-Z][A-Z0-9_]*_(?:PATH|DIR|FILE))=/gm)].map((m) => m[1]);
-    // The control: the pattern does find the variables this fix was written for.
-    expect(documented).toContain("SEED_CONFIG_PATH");
-    expect(documented).toContain("BASE_PATH");
-    const classified = new Set([...PATH_VARIABLES, ...Object.keys(URL_PATH_VARIABLES)]);
-    expect(documented.filter((name) => !classified.has(name))).toEqual([]);
-  });
-
-  test("no variable is both resolved and excluded", () => {
-    expect(PATH_VARIABLES.filter((name) => Object.hasOwn(URL_PATH_VARIABLES, name))).toEqual([]);
-  });
-});
-
 describe("launcher startup URL", () => {
   test.each([
     ["0.0.0.0", "http://127.0.0.1:3000"],
