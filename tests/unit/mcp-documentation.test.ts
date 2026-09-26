@@ -91,6 +91,12 @@ describe("docs/MCP.md", () => {
     );
   });
 
+  test("says run_read_query on PostgreSQL and SQL Server needs a least-privilege seed principal", () => {
+    expect(MCP_DOC).toContain("On PostgreSQL the seed's role must not be a superuser");
+    expect(MCP_DOC).toContain("and it must be granted `SHOWPLAN`");
+    expect(MCP_DOC).toContain("A seed entry cannot carry a separate agent credential");
+  });
+
   test("says a static Authorization header is required, because phase 1 serves no OAuth metadata", () => {
     expect(MCP_DOC).toContain("a client needs its `Authorization` header configured");
   });

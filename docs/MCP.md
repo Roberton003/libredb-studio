@@ -89,6 +89,11 @@ The opt-in is per connection, so `defaults.mcp` is refused.
 The built-in sample connections are never visible to an MCP client.
 An empty `list_connections` answer means no connection is opted in for your token's role: an operator adds `mcp: true` to a seed connection.
 
+`run_read_query` refuses a PostgreSQL or SQL Server connection whose own login could do more than read, so an opted-in seed for those engines needs a least-privilege principal.
+On PostgreSQL the seed's role must not be a superuser and must not hold `pg_read_server_files`, `pg_write_server_files` or `pg_execute_server_program`.
+On SQL Server the login must hold no fixed server role, neither `CONTROL SERVER` nor `ADMINISTER BULK OPERATIONS`, and none of `db_owner`, `db_accessadmin`, `db_securityadmin`, `db_ddladmin`, `db_backupoperator` or `db_datawriter`, and it must be granted `SHOWPLAN`.
+A seed entry cannot carry a separate agent credential, so the fix is the seed's own login; `inspect_schema` has no such requirement.
+
 ## Getting a token
 
 Open **MCP** in the user menu, the settings screen at `/settings/mcp`.
