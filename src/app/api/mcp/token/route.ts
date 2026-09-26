@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { guardRoute } from "@/lib/api/require-session";
-import { getSession } from "@/lib/auth";
+import { getSession, type UserPayload } from "@/lib/auth";
 import { logger } from "@/lib/logger";
 import { recordMcpMint } from "@/lib/mcp/audit";
 import { mcpChannelStatus } from "@/lib/mcp/config";
@@ -27,10 +27,26 @@ const AUDIT_FAILED = "The token was not issued because its audit record could no
 const SEED_UNREADABLE =
   "The seed connection file could not be read, so the connections an MCP token reaches are unknown; the server log names the cause";
 const NO_STORE = { "Cache-Control": "no-store" };
+const UNAUTHENTICATED = { error: "Authentication required" };
+
+/**
+ * verifyJWT accepts any payload signed with JWT_SECRET, and the OIDC state cookie an anonymous
+ * caller receives is one, with no user name and no role. This route answers and mints only for a
+ * payload that has the session's shape, so such a token reads nothing and reaches no guard that
+ * assumes a user name.
+ */
+function hasSessionShape(session: UserPayload | null): session is UserPayload {
+  return (
+    session !== null &&
+    typeof session.username === "string" &&
+    session.username.length > 0 &&
+    (session.role === "admin" || session.role === "user")
+  );
+}
 
 export async function GET(): Promise<Response> {
   const session = await getSession();
-  if (!session) return NextResponse.json({ error: "Authentication required" }, { status: 401 });
+  if (!hasSessionShape(session)) return NextResponse.json(UNAUTHENTICATED, { status: 401 });
   const status = mcpChannelStatus();
   const visible = await new McpConnectionContext({
     username: session.username,
@@ -50,6 +66,8 @@ export async function GET(): Promise<Response> {
 }
 
 export async function POST(request: Request): Promise<Response> {
+  const session = await getSession();
+  if (session !== null && !hasSessionShape(session)) return NextResponse.json(UNAUTHENTICATED, { status: 401 });
   const guard = await guardRoute({ route: "POST /api/mcp/token", bucket: "query", request });
   if ("response" in guard) return guard.response;
   const status = mcpChannelStatus();

@@ -18,6 +18,8 @@ mock.module("next/headers", () => ({
 const { GET, POST } = await import("@/app/api/mcp/token/route");
 const mcpRoute = await import("@/app/api/mcp/route");
 const { getSession, signJWT, verifyJWT } = await import("@/lib/auth");
+const { getJwtSecret } = await import("@/lib/config/auth-env");
+const { encryptState } = await import("@/lib/oidc");
 const { clearRateLimitState } = await import("@/lib/api/rate-limit");
 const { logger } = await import("@/lib/logger");
 const { verifyMcpToken } = await import("@/lib/mcp/token");
@@ -139,6 +141,37 @@ describe("GET /api/mcp/token", () => {
     await signIn("alice", "admin");
     for (let i = 0; i < 3; i += 1) expect((await GET()).status).toBe(200);
     expect((await POST(mintRequest())).status).toBe(200);
+  });
+});
+
+describe("a token signed with JWT_SECRET that is not a session", () => {
+  test("the OIDC state cookie is refused by GET and POST, and reads nothing", async () => {
+    cookieStore = {
+      "auth-token": { value: await encryptState({ code_verifier: "verifier", state: "state", nonce: "nonce" }) },
+    };
+    const status = await GET();
+    expect(status.status).toBe(401);
+    expect(await status.json()).toEqual({ error: "Authentication required" });
+    const mint = await POST(mintRequest());
+    expect(mint.status).toBe(401);
+    expect(await mint.json()).toEqual({ error: "Authentication required" });
+  });
+
+  test.each([
+    ["an empty user name", { username: "", role: "admin" }],
+    ["a role that is neither admin nor user", { username: "bob", role: "owner" }],
+  ])("a payload with %s is refused by both", async (_name, payload) => {
+    cookieStore = {
+      "auth-token": {
+        value: await new SignJWT(payload)
+          .setProtectedHeader({ alg: "HS256" })
+          .setIssuedAt()
+          .setExpirationTime("1h")
+          .sign(getJwtSecret()),
+      },
+    };
+    expect((await GET()).status).toBe(401);
+    expect((await POST(mintRequest())).status).toBe(401);
   });
 });
 
