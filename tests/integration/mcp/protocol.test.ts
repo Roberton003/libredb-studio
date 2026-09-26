@@ -333,7 +333,8 @@ describe("the protocol layer's source", () => {
     // One pattern per tree: Bun's glob matches no brace alternative that contains a slash.
     const files: string[] = [];
     for (const pattern of ["src/lib/mcp/**/*.ts", "src/app/api/mcp/**/*.ts"]) {
-      files.push(...new Bun.Glob(pattern).scanSync(ROOT));
+      // Windows yields backslash-separated paths, and the assertions below name POSIX ones.
+      for (const file of new Bun.Glob(pattern).scanSync(ROOT)) files.push(file.replaceAll("\\", "/"));
     }
     // The control: the scan found the protocol layer.
     expect(files).toContain("src/lib/mcp/server.ts");
