@@ -1,9 +1,43 @@
-import type { CallToolResult, McpServer } from "@modelcontextprotocol/server";
+import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
+import { containerDepth } from "@/lib/db/object-kinds";
+import type { Container, DatabaseObject, DatabaseProvider } from "@/lib/db/types";
+import {
+  newMcpCorrelationId,
+  recordMcpDecision,
+  recordMcpOutcome,
+  type McpCallRecord,
+  type McpToolAuditReason,
+} from "../audit";
 import type { McpConnectionContext, McpToolCall } from "../context";
-import { safeJsonStringify, redactErrorMessage } from "../serializer";
-import { emitAuditEvent } from "@/lib/audit";
-import { randomUUID } from "node:crypto";
+import {
+  cutUtf8,
+  engineError,
+  MCP_CANCELLED_TEXT,
+  MCP_ENGINE_ERROR_PREFIX,
+  MCP_NOT_VISIBLE_TEXT,
+  MCP_READ_ONLY_ANNOTATIONS,
+  MCP_RESULT_CAP_BYTES,
+  MCP_TABLE_COMMENT_CAP_BYTES,
+  MCP_UNTRUSTED_NOTICE,
+  ownWordsError,
+  recordOrRefuse,
+  resultBytes,
+  untrustedResult,
+  type ToolResult,
+} from "../output";
+
+/**
+ * inspect_schema (#246): one connection's tables, their columns and, on request, their indexes,
+ * behind the untrusted-content notice, because every name, type, default and comment here is
+ * database content someone else may have written.
+ *
+ * It acquires under agent-operations, which sends no statement and so runs on every engine. The
+ * decision event is written before acquisition and the outcome after, and a call whose record
+ * cannot be written runs nothing. The page is fitted to the result cap at a table boundary, a
+ * table comment is cut to its own bound first, and the column and index caps count what they leave
+ * out instead of adding fake entries.
+ */
 
 export const InspectSchemaInputSchema = z.object({
   connection_id: z.string().min(1, "connection_id is required"),
@@ -15,221 +49,205 @@ export const InspectSchemaInputSchema = z.object({
   include_indexes: z.boolean().default(false),
 });
 
-export type InspectSchemaInput = z.infer<typeof InspectSchemaInputSchema>;
+const InspectedTableSchema = z.object({
+  name: z.string(),
+  kind: z.string(),
+  comment: z.string().optional(),
+  comment_truncated: z.literal(true).optional(),
+  columns: z
+    .array(
+      z.object({
+        name: z.string(),
+        data_type: z.string(),
+        is_nullable: z.boolean(),
+        default_value: z.string().nullable(),
+        is_primary_key: z.boolean(),
+      }),
+    )
+    .optional(),
+  columns_omitted: z.number().int(),
+  indexes: z.array(z.object({ name: z.string(), columns: z.array(z.string()), is_unique: z.boolean() })).optional(),
+  indexes_omitted: z.number().int(),
+});
 
-export interface SchemaInspectionResult {
-  connection_id: string;
-  schema: string;
-  total_tables: number;
-  limit: number;
-  offset: number;
-  has_more: boolean;
-  tables: Array<{
-    name: string;
-    kind: "table" | "view" | "materialized_view";
-    comment?: string;
-    columns?: Array<{
-      name: string;
-      data_type: string;
-      is_nullable: boolean;
-      default_value?: string | null;
-      is_primary_key: boolean;
-      comment?: string;
-    }>;
-    indexes?: Array<{
-      name: string;
-      columns: string[];
-      is_unique: boolean;
-    }>;
-  }>;
-}
+const InspectSchemaOutputSchema = z.object({
+  connection_id: z.string(),
+  schema: z.string(),
+  total_tables: z.number().int(),
+  offset: z.number().int(),
+  limit: z.number().int(),
+  has_more: z.boolean(),
+  next_offset: z.number().int().nullable(),
+  tables: z.array(InspectedTableSchema),
+});
+
+export type InspectSchemaInput = z.infer<typeof InspectSchemaInputSchema>;
+type InspectedTable = z.infer<typeof InspectedTableSchema>;
+
+const INSPECT_SCHEMA_TITLE = "Inspect schema";
+export const INSPECT_SCHEMA_DESCRIPTION = `List the tables of one connection with their columns and, on request, their indexes. Works on every engine. Pages with limit and offset; has_more and next_offset say when more tables exist. ${MCP_UNTRUSTED_NOTICE}`;
+
+const MAX_COLUMNS = 50;
+const MAX_INDEXES = 25;
+const SCHEMA_NOT_FOUND_TEXT =
+  "This connection has no schema of that name. Call inspect_schema without schema to read the default one.";
+const FIRST_TABLE_OVER_CAP_TEXT =
+  "The first table on this page is larger than the 32 KiB result limit on its own. Call inspect_schema again for it with limit 1 and include_columns and include_indexes set to false.";
+const FIRST_TABLE_OVER_CAP_BARE_TEXT =
+  "The first table on this page does not fit the 32 KiB result limit even without its columns and indexes, so it cannot be listed here.";
+
+type ContainerChoice =
+  | { readonly kind: "root" }
+  | { readonly kind: "found"; readonly container: Container }
+  | { readonly kind: "none" }
+  | { readonly kind: "not-found" };
 
 /**
- * Inspects database schema, tables, views, and columns across supported engines
- * using the canonical 'agent-operations' profile.
+ * The container the page is read from: at each level above the deepest the one the session is in,
+ * or the first listed, and at the deepest the named schema, matched case-insensitively, or the
+ * same default. An engine that declares no level is read at its root; a level that lists nothing
+ * leaves nothing to read.
  */
-async function inspectSchema(args: InspectSchemaInput, call: McpToolCall): Promise<CallToolResult> {
+async function chooseContainer(provider: DatabaseProvider, schema: string | undefined): Promise<ContainerChoice> {
+  const depth = containerDepth(provider.getCapabilities());
+  const wanted = schema?.toLowerCase();
+  if (depth === 0) return wanted === undefined ? { kind: "root" } : { kind: "not-found" };
+  let parent: readonly string[] | undefined;
+  for (let level = 0; ; level += 1) {
+    const containers = await provider.listContainers(parent);
+    const deepest = level === depth - 1;
+    const named = deepest && wanted !== undefined;
+    const chosen = named
+      ? containers.find((candidate) => candidate.name.toLowerCase() === wanted)
+      : (containers.find((candidate) => candidate.isSessionDefault === true) ?? containers[0]);
+    if (chosen === undefined) return named ? { kind: "not-found" } : { kind: "none" };
+    if (deepest) return { kind: "found", container: chosen };
+    parent = chosen.path;
+  }
+}
+
+/** A comment an engine reports on an object; no provider fills one today (src/lib/db/types.ts). */
+function commentOf(source: unknown): string | undefined {
+  const comment = (source as { comment?: unknown }).comment;
+  return typeof comment === "string" ? comment : undefined;
+}
+
+async function inspectTable(
+  provider: DatabaseProvider,
+  object: DatabaseObject,
+  args: InspectSchemaInput,
+): Promise<InspectedTable> {
+  const detail =
+    args.include_columns || args.include_indexes ? await provider.describeObject(object.path, "table") : null;
+  const rawComment = (detail === null ? undefined : commentOf(detail)) ?? commentOf(object);
+  const comment = rawComment === undefined ? undefined : cutUtf8(rawComment, MCP_TABLE_COMMENT_CAP_BYTES);
+  const columns = detail?.columns ?? [];
+  const indexes = detail?.indexes ?? [];
+  return {
+    name: object.name,
+    kind: object.kind,
+    ...(comment === undefined ? {} : { comment: comment.text }),
+    ...(comment?.cut === true ? { comment_truncated: true as const } : {}),
+    ...(args.include_columns
+      ? {
+          columns: columns.slice(0, MAX_COLUMNS).map((column) => ({
+            name: column.name,
+            data_type: column.type,
+            is_nullable: column.nullable,
+            default_value: column.defaultValue ?? null,
+            is_primary_key: column.isPrimary,
+          })),
+        }
+      : {}),
+    columns_omitted: args.include_columns ? Math.max(0, columns.length - MAX_COLUMNS) : 0,
+    ...(args.include_indexes
+      ? {
+          indexes: indexes
+            .slice(0, MAX_INDEXES)
+            .map((index) => ({ name: index.name, columns: [...index.columns], is_unique: index.unique })),
+        }
+      : {}),
+    indexes_omitted: args.include_indexes ? Math.max(0, indexes.length - MAX_INDEXES) : 0,
+  };
+}
+
+function pageResult(
+  args: InspectSchemaInput,
+  container: Container | null,
+  total: number,
+  tables: readonly InspectedTable[],
+  cutByCap: boolean,
+): ToolResult {
+  const hasMore = cutByCap || args.offset + tables.length < total;
+  return untrustedResult({
+    connection_id: args.connection_id,
+    schema: container?.name ?? "default",
+    total_tables: total,
+    offset: args.offset,
+    limit: args.limit,
+    has_more: hasMore,
+    next_offset: hasMore ? args.offset + tables.length : null,
+    tables: [...tables],
+  });
+}
+
+async function readPage(
+  provider: DatabaseProvider,
+  args: InspectSchemaInput,
+  signal: AbortSignal,
+): Promise<{ readonly result: ToolResult; readonly failure?: McpToolAuditReason }> {
+  const choice = await chooseContainer(provider, args.schema);
+  if (choice.kind === "not-found")
+    return { result: ownWordsError(SCHEMA_NOT_FOUND_TEXT), failure: "mcp_schema_not_found" };
+  const container = choice.kind === "found" ? choice.container : null;
+  const objects = choice.kind === "none" ? [] : await provider.listObjects(container?.path ?? [], "table");
+  const wanted = args.table?.toLowerCase();
+  const filtered = wanted === undefined ? objects : objects.filter((object) => object.name.toLowerCase() === wanted);
+  const tables: InspectedTable[] = [];
+  for (const object of filtered.slice(args.offset, args.offset + args.limit)) {
+    if (signal.aborted) return { result: ownWordsError(MCP_CANCELLED_TEXT), failure: "mcp_cancelled" };
+    const table = await inspectTable(provider, object, args);
+    if (resultBytes(pageResult(args, container, filtered.length, [...tables, table], false)) > MCP_RESULT_CAP_BYTES) {
+      if (tables.length > 0) return { result: pageResult(args, container, filtered.length, tables, true) };
+      const bare = !args.include_columns && !args.include_indexes;
+      return {
+        result: ownWordsError(bare ? FIRST_TABLE_OVER_CAP_BARE_TEXT : FIRST_TABLE_OVER_CAP_TEXT),
+        failure: "mcp_result_too_large",
+      };
+    }
+    tables.push(table);
+  }
+  return { result: pageResult(args, container, filtered.length, tables, false) };
+}
+
+export async function inspectSchema(args: InspectSchemaInput, call: McpToolCall): Promise<ToolResult> {
+  const record: McpCallRecord = {
+    action: "inspect_schema",
+    user: call.context.caller.username,
+    correlationId: newMcpCorrelationId(),
+  };
+  const refuse = (reason: McpToolAuditReason, text: string) =>
+    recordOrRefuse(() => recordMcpDecision(record, reason)) ?? ownWordsError(text);
+
+  if (call.signal.aborted) return refuse("mcp_cancelled", MCP_CANCELLED_TEXT);
+  const connection = await call.context.resolve(args.connection_id);
+  if (connection === null) return refuse("mcp_connection_not_visible", MCP_NOT_VISIBLE_TEXT);
+
+  const resolved: McpCallRecord = { ...record, connectionName: connection.seedId };
+  const unrecorded = recordOrRefuse(() => recordMcpDecision(resolved));
+  if (unrecorded !== null) return unrecorded;
+
   const startedAt = Date.now();
-  let parsedConnectionId: string | undefined;
-  const callerId = call.context.caller.username;
-  const correlationId = randomUUID();
+  const finish = (result: ToolResult, failure?: McpToolAuditReason): ToolResult =>
+    recordOrRefuse(() => recordMcpOutcome(resolved, Date.now() - startedAt, failure)) ?? result;
 
   try {
-    const parsed = args;
-    parsedConnectionId = parsed.connection_id;
-    const connection = await call.context.resolve(parsed.connection_id);
-    if (connection === null) throw new Error(`Connection not found: "${parsed.connection_id}"`);
     const provider = await call.context.acquire(connection, "agent-operations");
-
-    // 1. Determine target container (schema/catalog)
-    const containers = await provider.listContainers();
-
-    let targetContainer: any;
-    if (parsed.schema) {
-      targetContainer = containers.find((c: any) => c.name.toLowerCase() === parsed.schema?.toLowerCase());
-      if (!targetContainer) {
-        emitAuditEvent({
-          type: "agent_operation",
-          action: "inspect_schema",
-          target: parsed.connection_id,
-          user: callerId,
-          result: "failure",
-          reason: "agent_execution_failed",
-          duration: Date.now() - startedAt,
-          correlationId,
-        });
-        return {
-          isError: true,
-          content: [
-            {
-              type: "text",
-              text: `Schema "${parsed.schema}" not found in connection "${parsed.connection_id}".`,
-            },
-          ],
-        };
-      }
-    } else {
-      targetContainer = containers[0];
-    }
-
-    const containerPath = targetContainer ? targetContainer.path : [];
-
-    // 2. List objects of type "table"
-    const allObjects = await provider.listObjects(containerPath, "table");
-
-    // Filter by specific table if provided
-    const filteredObjects = parsed.table
-      ? allObjects.filter((o: any) => o.name.toLowerCase() === parsed.table?.toLowerCase())
-      : allObjects;
-
-    const totalTables = filteredObjects.length;
-    const paginatedObjects = filteredObjects.slice(parsed.offset, parsed.offset + parsed.limit);
-    const hasMore = parsed.offset + parsed.limit < totalTables;
-
-    const tablesDetails: SchemaInspectionResult["tables"] = [];
-
-    for (const obj of paginatedObjects) {
-      let columns: SchemaInspectionResult["tables"][0]["columns"] | undefined;
-      let indexes: SchemaInspectionResult["tables"][0]["indexes"] | undefined;
-      let comment: string | undefined = (obj as any).comment;
-
-      if (parsed.include_columns || parsed.include_indexes) {
-        const detail = await provider.describeObject(obj.path, "table");
-        if ((detail as any)?.comment) {
-          comment = (detail as any).comment;
-        }
-
-        if (parsed.include_columns && detail.columns) {
-          const rawCols = Array.isArray(detail.columns) ? detail.columns : [];
-          const isColsTruncated = rawCols.length > 50;
-          const slicedCols = rawCols.slice(0, 50);
-          columns = slicedCols.map((c: any) => ({
-            name: c.name,
-            data_type: c.type,
-            is_nullable: c.nullable ?? true,
-            default_value: c.defaultValue !== undefined ? String(c.defaultValue) : null,
-            is_primary_key: Boolean(c.isPrimary),
-          }));
-          if (isColsTruncated) {
-            columns.push({
-              name: `... [TRUNCATED: ${rawCols.length - 50} additional columns omitted]`,
-              data_type: "text",
-              is_nullable: true,
-              default_value: null,
-              is_primary_key: false,
-            });
-          }
-        }
-
-        if (parsed.include_indexes && detail.indexes) {
-          const rawIdx = Array.isArray(detail.indexes) ? detail.indexes : [];
-          const isIdxTruncated = rawIdx.length > 25;
-          const slicedIdx = rawIdx.slice(0, 25);
-          indexes = slicedIdx.map((idx: any) => ({
-            name: idx.name,
-            columns: [...idx.columns],
-            is_unique: Boolean(idx.unique),
-          }));
-          if (isIdxTruncated) {
-            indexes.push({
-              name: `... [TRUNCATED: ${rawIdx.length - 25} additional indexes omitted]`,
-              columns: [],
-              is_unique: false,
-            });
-          }
-        }
-      }
-
-      tablesDetails.push({
-        name: obj.name,
-        kind: (obj.kind as "table" | "view" | "materialized_view") || "table",
-        comment,
-        columns,
-        indexes,
-      });
-    }
-
-    const result: SchemaInspectionResult = {
-      connection_id: parsed.connection_id,
-      schema: targetContainer ? targetContainer.name : "default",
-      total_tables: totalTables,
-      limit: parsed.limit,
-      offset: parsed.offset,
-      has_more: hasMore,
-      tables: tablesDetails,
-    };
-
-    let jsonText = safeJsonStringify(result, 2);
-    // Defense in depth: if payload still exceeds 64 KiB, truncate tables
-    if (Buffer.byteLength(jsonText) > 64 * 1024) {
-      while (tablesDetails.length > 1 && Buffer.byteLength(safeJsonStringify(result, 2)) > 64 * 1024) {
-        tablesDetails.pop();
-      }
-      result.has_more = true;
-      jsonText = safeJsonStringify(result, 2);
-    }
-
-    emitAuditEvent({
-      type: "agent_operation",
-      action: "inspect_schema",
-      target: parsed.connection_id,
-      user: callerId,
-      result: "success",
-      duration: Date.now() - startedAt,
-      correlationId,
-    });
-
-    return {
-      content: [
-        {
-          type: "text",
-          text: jsonText,
-        },
-      ],
-    };
-  } catch (error: any) {
-    if (parsedConnectionId) {
-      emitAuditEvent({
-        type: "agent_operation",
-        action: "inspect_schema",
-        target: parsedConnectionId,
-        user: callerId,
-        result: "failure",
-        reason: "agent_execution_failed",
-        duration: Date.now() - startedAt,
-        correlationId,
-      });
-    }
-
-    return {
-      isError: true,
-      content: [
-        {
-          type: "text",
-          text: `Failed to inspect schema: ${redactErrorMessage(error?.message || String(error))}`,
-        },
-      ],
-    };
+    if (call.signal.aborted) return finish(ownWordsError(MCP_CANCELLED_TEXT), "mcp_cancelled");
+    const { result, failure } = await readPage(provider, args, call.signal);
+    return finish(result, failure);
+  } catch (error) {
+    return finish(engineError(MCP_ENGINE_ERROR_PREFIX, error), "mcp_execution_failed");
   }
 }
 
@@ -237,9 +255,11 @@ export function registerInspectSchema(server: McpServer, context: McpConnectionC
   server.registerTool(
     "inspect_schema",
     {
-      description:
-        "Inspect catalog schemas, tables, columns, and indexes with pagination support across all supported databases.",
+      title: INSPECT_SCHEMA_TITLE,
+      description: INSPECT_SCHEMA_DESCRIPTION,
       inputSchema: InspectSchemaInputSchema,
+      outputSchema: InspectSchemaOutputSchema,
+      annotations: MCP_READ_ONLY_ANNOTATIONS,
     },
     (args, ctx) => inspectSchema(args, { context, signal: ctx.mcpReq.signal }),
   );
