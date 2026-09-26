@@ -191,16 +191,16 @@ describe("a token signed with JWT_SECRET that is not a session", () => {
 describe("a URL that carries credentials", () => {
   test("is named by its rule in both answers, and no part of it is repeated", async () => {
     restoreChannel();
-    // Built from parts, so the file holds no literal credential URL for a secret scanner to flag.
+    // Built from parts with a password generated at run time, so the file holds no credential for a secret scanner to flag.
     const credentialed = new URL("https://studio.example/api/mcp");
     credentialed.username = "someone";
-    credentialed.password = "hunter-two";
+    credentialed.password = crypto.randomUUID();
     restoreChannel = useMcpChannel({ url: credentialed.href });
     await signIn("alice", "admin");
     for (const response of [await GET(), await POST(mintRequest())]) {
       const text = await response.text();
       expect(JSON.parse(text).problems).toContain("LIBREDB_MCP_URL must not carry a user name or password");
-      for (const part of ["someone", "hunter-two", "studio.example"]) expect(text).not.toContain(part);
+      for (const part of ["someone", credentialed.password, "studio.example"]) expect(text).not.toContain(part);
     }
   });
 });

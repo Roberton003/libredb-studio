@@ -213,10 +213,10 @@ describe("verification", () => {
     restore = useMcpChannel({ url: null });
     await expectRefused(token, "channel_unconfigured");
     restore();
-    // Built from parts, so the file holds no literal credential URL for a secret scanner to flag.
+    // Built from parts with a password generated at run time, so the file holds no credential for a secret scanner to flag.
     const credentialed = new URL("https://mcp-host.test/api/mcp");
     credentialed.username = "someone";
-    credentialed.password = "hunter-two";
+    credentialed.password = crypto.randomUUID();
     restore = useMcpChannel({ url: credentialed.href });
     await expectRefused(token, "channel_unconfigured");
   });

@@ -111,14 +111,15 @@ describe("LIBREDB_MCP_URL", () => {
   });
 
   test("a URL with user info is refused without quoting any part of it", () => {
-    // Built from parts, so the file holds no literal credential URL for a secret scanner to flag.
+    // Built from parts with a password generated at run time, so the file holds no credential for a secret scanner to flag.
     const credentialed = new URL("https://mcp-host.test/api/mcp");
     credentialed.username = "someone";
-    credentialed.password = "hunter-two";
+    credentialed.password = crypto.randomUUID();
     process.env[MCP_URL_ENV] = credentialed.href;
     const reading = readMcpUrl();
     expect(reading).toEqual({ ok: false, problem: "LIBREDB_MCP_URL must not carry a user name or password" });
-    for (const part of ["someone", "hunter-two", "mcp-host.test"]) expect(JSON.stringify(reading)).not.toContain(part);
+    for (const part of ["someone", credentialed.password, "mcp-host.test"])
+      expect(JSON.stringify(reading)).not.toContain(part);
   });
 });
 
