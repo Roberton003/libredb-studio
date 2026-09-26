@@ -100,22 +100,27 @@ export function engineError(prefix: string, error: unknown): ToolResult {
   };
 }
 
+/** More rounds than any real result needs: each one after the first settles unless a digit is added. */
+export const MCP_BYTE_SIZE_MAX_ROUNDS = 8;
+
 /**
  * byte_size sits inside the result it measures, twice, so it is found as a fixed point: start at 0
  * and set it to the measured length until it stops changing. The length grows only when the
- * number gains a digit, so this ends within a few rounds.
+ * number gains a digit, so this ends within a few rounds; a build whose size does not follow that
+ * rule throws after MCP_BYTE_SIZE_MAX_ROUNDS instead of looping.
  */
 export function withByteSize<T extends { byte_size: number }>(
   structured: T,
   build: (structured: T) => ToolResult,
 ): { readonly result: ToolResult; readonly bytes: number } {
   let current: T = { ...structured, byte_size: 0 };
-  for (;;) {
+  for (let round = 0; round < MCP_BYTE_SIZE_MAX_ROUNDS; round++) {
     const result = build(current);
     const bytes = resultBytes(result);
     if (bytes === current.byte_size) return { result, bytes };
     current = { ...structured, byte_size: bytes };
   }
+  throw new Error(`byte_size did not settle within ${MCP_BYTE_SIZE_MAX_ROUNDS} rounds`);
 }
 
 /**

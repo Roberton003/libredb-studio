@@ -9,6 +9,7 @@ import {
   cutUtf8,
   engineError,
   engineMessage,
+  MCP_BYTE_SIZE_MAX_ROUNDS,
   MCP_CANCELLED_TEXT,
   MCP_ENGINE_ERROR_PREFIX,
   MCP_NOT_VISIBLE_TEXT,
@@ -86,8 +87,10 @@ describe("engine messages", () => {
 
   test("redact a secret the cut point would have split, because redaction runs first", () => {
     const message = engineMessage(new Error(`${"x".repeat(4_070)} postgres://reader:hunter-two@db.internal/app`));
-    expect(message).not.toContain("hunter-two");
-    expect(message.endsWith(MCP_ENGINE_MESSAGE_CUT_SUFFIX)).toBe(true);
+    // Redacted first, the marker ends at byte 4,093 and only "db." of the host fits; cut first, the
+    // "@" would fall past the cut, the userinfo pattern would never match and "reader:hunter-" would leak.
+    expect(message).toBe(`${"x".repeat(4_070)} postgres://[REDACTED]@db.${MCP_ENGINE_MESSAGE_CUT_SUFFIX}`);
+    expect(message).not.toContain("reader");
   });
 
   test("read a thrown value that is not an Error", () => {
@@ -148,6 +151,14 @@ describe("byte_size", () => {
     },
   );
 
+  test("throws, naming the rounds, when the size never settles", () => {
+    const neverSettles = (structured: { byte_size: number }) =>
+      plainResult({ ...structured, pad: "p".repeat(structured.byte_size) });
+    expect(() => withByteSize({ byte_size: 0 }, neverSettles)).toThrow(
+      `byte_size did not settle within ${MCP_BYTE_SIZE_MAX_ROUNDS} rounds`,
+    );
+  });
+
   test("resultBytes is the UTF-8 length of the compact JSON of the result", () => {
     const result = plainResult({ name: `${TWO}${THREE}` });
     expect(resultBytes(result)).toBe(independentBytes(result));
@@ -159,7 +170,7 @@ describe("recordOrRefuse", () => {
     expect(recordOrRefuse(() => {})).toBeNull();
   });
 
-  test("answers the fixed audit-failure result, logs once and leaks neither message, when the sink throws", () => {
+  test("answers the fixed audit-failure result, logs once and quotes nothing from the error in the result, when the sink throws", () => {
     const errorLog = spyOn(logger, "error").mockImplementation(() => {});
     try {
       const refusal = recordOrRefuse(() => {
