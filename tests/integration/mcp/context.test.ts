@@ -11,6 +11,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, spyOn, test } from "b
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { acquireExecutionProfileProvider } from "@/lib/db/factory";
 import { SQLiteProvider } from "@/lib/db/providers/sql/sqlite";
 import { logger } from "@/lib/logger";
 import { MCP_CONNECTIONS_UNREADABLE, McpConnectionContext } from "@/lib/mcp/context";
@@ -19,6 +20,7 @@ import {
   createSqliteFile,
   failNextCall,
   gateMethod,
+  holdGate,
   pinMcpTestEnvironment,
   resetMcpTestState,
   writeSeedFile,
@@ -123,11 +125,34 @@ describe("acquire", () => {
     try {
       const acquisitions = Array.from({ length: 12 }, () => context.acquire(connection, "agent-read-only"));
       await gate.entered;
+      await holdGate();
+      expect(gate.calls).toBe(1);
       gate.release();
       const providers = await Promise.all(acquisitions);
 
       expect(gate.calls).toBe(1);
       expect(new Set(providers).size).toBe(1);
+    } finally {
+      gate.release();
+      gate.restore();
+    }
+  });
+
+  test("the same hold without the join opens twelve providers, so the case above can tell the two apart", async () => {
+    seedShop();
+    const connection = await shopConnection(new McpConnectionContext(alice));
+    const gate = gateMethod(SQLiteProvider.prototype, "connect");
+    try {
+      const acquisitions = Array.from({ length: 12 }, () =>
+        acquireExecutionProfileProvider(connection, "agent-read-only"),
+      );
+      await gate.entered;
+      await holdGate();
+      expect(gate.calls).toBe(12);
+      gate.release();
+      const providers = new Set(await Promise.all(acquisitions));
+      expect(providers.size).toBe(12);
+      await Promise.all([...providers].map((provider) => provider.disconnect()));
     } finally {
       gate.release();
       gate.restore();

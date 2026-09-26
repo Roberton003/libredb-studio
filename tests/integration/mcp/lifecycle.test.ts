@@ -22,6 +22,7 @@ import {
   countMethod,
   createSqliteFile,
   gateMethod,
+  holdGate,
   pinMcpTestEnvironment,
   resetMcpTestState,
   waitFor,
@@ -211,6 +212,8 @@ describe("one provider per connection and profile", () => {
     try {
       const calls = Array.from({ length: 12 }, (_, index) => serve(legacyPost(runQuery(index + 1), { token })));
       await gate.entered;
+      await holdGate();
+      expect(gate.calls).toBe(1);
       gate.release();
       const replies = await Promise.all(calls.map(async (call) => readJsonRpc(await call)));
       expect(replies.every((reply) => reply.result?.isError !== true)).toBe(true);

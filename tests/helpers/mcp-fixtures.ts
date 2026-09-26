@@ -183,6 +183,18 @@ export function failNextCall(prototype: object, name: string, error: Error): Met
   };
 }
 
+/**
+ * How long a concurrency test keeps a gate shut after its first entry: long enough for every
+ * other concurrent caller to reach the gated method or join the pending call. Releasing at once
+ * lets the first call finish before the others reach the factory's cache, which then serves them
+ * and hides a missing join.
+ */
+export const CONCURRENT_HOLD_MS = 100;
+
+export async function holdGate(ms: number = CONCURRENT_HOLD_MS): Promise<void> {
+  await new Promise((resolveTick) => setTimeout(resolveTick, ms));
+}
+
 /** Polls a condition the server settles asynchronously, and fails with a named timeout. */
 export async function waitFor(check: () => boolean, timeoutMs = 3_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
