@@ -62,6 +62,7 @@ It grants nothing beyond continuing that run: what the run may read is decided b
 That token is signed with a key derived from `JWT_SECRET` under the configured `LIBREDB_MCP_TOKEN_LABEL`, so it is not a session either; it carries the role its owner had when it was minted, the `mcp:read` scope and the canonical `LIBREDB_MCP_URL` as its audience, and the session cookie opens nothing on that path.
 What a token may reach is decided again on every call, over the connections the seed file opts in for that role.
 An MCP token outlives a deleted or disabled account and a lowered role until it expires or `LIBREDB_MCP_TOKEN_LABEL` changes, and changing the label, which revokes every token at once, is the only revocation.
+Minting needs a session signed in within the last ten minutes, so a person who can no longer sign in cannot mint under a rotated label once ten minutes have passed; offboarding is stopping the sign-in, then rotating the label after that window, or rotating `JWT_SECRET`, which also ends every session.
 `src/proxy.ts`'s public-path list is unchanged: the middleware admits each of the two paths only when its credential verifies, and each handler verifies it again.
 
 **0.6.** This is not a target allowlist: which server a connection reaches is still the user's

@@ -98,7 +98,10 @@ When it is ready, **Create token** mints one for you and shows it once: copy it 
 - A token is valid for `LIBREDB_MCP_TOKEN_TTL_DAYS` days, 30 by default.
 - It carries the role you had when you minted it, so a lowered role keeps working until the token expires or the label changes.
 - Changing `LIBREDB_MCP_TOKEN_LABEL` revokes every MCP token at once, and it is the only revocation there is.
-- Deleting a local user, disabling an OIDC account or changing a password leaves that user's MCP tokens valid until they expire, so removing a person's access means rotating `LIBREDB_MCP_TOKEN_LABEL`.
+- Creating a token needs a sign-in from the last ten minutes: an older session is asked to sign in again, because a session lives 24 hours and cannot be ended on the server.
+- Deleting a local user, disabling an OIDC account or changing a password leaves that user's MCP tokens valid until they expire.
+  Removing a person's access therefore takes two steps: stop them signing in, then rotate `LIBREDB_MCP_TOKEN_LABEL` once ten minutes have passed, so no session they still hold can mint under the new label.
+  Rotating `JWT_SECRET` instead ends every session and revokes every MCP token at once.
 - A changed `LIBREDB_MCP_URL`, and under npx a changed `--host` or `--port`, invalidates every token too.
 
 ## Client configuration

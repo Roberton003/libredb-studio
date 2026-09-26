@@ -264,7 +264,8 @@ mcp:
   url: ""
   # -- Any non-empty value. The token signing key is derived from the JWT secret
   # under it, so changing it revokes every MCP token at once, which is the only
-  # revocation there is: change it to offboard a person.
+  # revocation there is. To offboard a person, stop them signing in, then change
+  # it once ten minutes have passed, since minting needs a sign-in that recent.
   tokenLabel: ""
   # -- How many days a minted token stays valid, from 1 to 365.
   tokenTtlDays: 30

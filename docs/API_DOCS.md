@@ -1567,6 +1567,7 @@ Mints a token for the signed-in user and role; it reads no body field and spends
 |---|---|
 | 200 | `{ "token": "...", "expiresAt": "<ISO 8601>", "url": "..." }` with `Cache-Control: no-store`; the token appears in no other response |
 | 401 | `{ "error": "Authentication required" }` |
+| 403 | `{ "error": "Sign in again to create a token: a token can only be created within 10 minutes of signing in." }`, with `Cache-Control: no-store`, when the session was signed in more than ten minutes ago |
 | 409 | `{ "error": "MCP tokens cannot be issued on this server", "problems": [ "..." ] }` |
 | 429 | The rate-limit body of [Error Handling](#error-handling), with `Retry-After` |
 | 500 | `{ "error": "The token was not issued because its audit record could not be written." }` |

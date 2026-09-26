@@ -18,7 +18,7 @@ export const dynamic = "force-dynamic";
  * whether a feature is ready before it renders cannot spend the budget of the work. POST goes
  * through guardRoute, takes no body field (the owner is always the session's user, with the
  * session's role), refuses with the configuration's problems when the channel is not ready,
- * records the mint before it signs, and answers the token once, marked no-store. Nothing about a
+ * refuses a session signed in more than ten minutes ago, records the mint before it signs, and answers the token once, marked no-store. Nothing about a
  * token is stored.
  */
 
@@ -28,6 +28,20 @@ const SEED_UNREADABLE =
   "The seed connection file could not be read, so the connections an MCP token reaches are unknown; the server log names the cause";
 const NO_STORE = { "Cache-Control": "no-store" };
 const UNAUTHENTICATED = { error: "Authentication required" };
+const MINT_SESSION_MAX_AGE_SECONDS = 600;
+const RECENT_SIGN_IN_REQUIRED =
+  "Sign in again to create a token: a token can only be created within 10 minutes of signing in.";
+
+/**
+ * A session cannot be revoked on the server and lives 24 hours, so rotating
+ * LIBREDB_MCP_TOKEN_LABEL would not offboard a person who still holds one: they could mint again
+ * under the new label. Minting therefore needs a sign-in from the last ten minutes, which an
+ * account that can no longer sign in cannot produce. A payload with no issue time is refused.
+ */
+function signedInRecently(session: UserPayload): boolean {
+  const issuedAt = (session as { iat?: unknown }).iat;
+  return typeof issuedAt === "number" && Date.now() / 1000 - issuedAt <= MINT_SESSION_MAX_AGE_SECONDS;
+}
 
 /**
  * verifyJWT accepts any payload signed with JWT_SECRET, and the OIDC state cookie an anonymous
@@ -73,6 +87,9 @@ export async function POST(request: Request): Promise<Response> {
   const status = mcpChannelStatus();
   if (status.state !== "ready") {
     return NextResponse.json({ error: NOT_ISSUED, problems: [...status.problems] }, { status: 409, headers: NO_STORE });
+  }
+  if (!signedInRecently(guard.session)) {
+    return NextResponse.json({ error: RECENT_SIGN_IN_REQUIRED }, { status: 403, headers: NO_STORE });
   }
   try {
     recordMcpMint(guard.session.username);

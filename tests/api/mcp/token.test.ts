@@ -39,6 +39,19 @@ async function signIn(username: string, role: "admin" | "user"): Promise<void> {
   cookieStore = { "auth-token": { value: await signJWT({ username, role }) } };
 }
 
+async function signInSecondsAgo(seconds: number): Promise<void> {
+  const issuedAt = Math.floor(Date.now() / 1000) - seconds;
+  const token = await new SignJWT({ username: "bob", role: "admin" })
+    .setProtectedHeader({ alg: "HS256" })
+    .setIssuedAt(issuedAt)
+    .setExpirationTime(issuedAt + 86_400)
+    .sign(getJwtSecret());
+  cookieStore = { "auth-token": { value: token } };
+}
+
+const RECENT_SIGN_IN_REQUIRED =
+  "Sign in again to create a token: a token can only be created within 10 minutes of signing in.";
+
 const mintRequest = (headers: Record<string, string> = {}) =>
   new Request("http://localhost:3000/api/mcp/token", {
     method: "POST",
@@ -269,6 +282,45 @@ describe("POST /api/mcp/token", () => {
       }
     },
   );
+
+  test("refuses a session signed more than ten minutes ago and signs nothing, so a rotated label is not re-minted on an old session", async () => {
+    await signInSecondsAgo(601);
+    const signs = spyOn(SignJWT.prototype, "sign");
+    const sink = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const response = await POST(mintRequest());
+      expect(response.status).toBe(403);
+      expect(response.headers.get("cache-control")).toBe("no-store");
+      expect(await response.json()).toEqual({ error: RECENT_SIGN_IN_REQUIRED });
+      expect(signs).not.toHaveBeenCalled();
+      const lines = sink.mock.calls.map(([line]) => JSON.parse(String(line)) as Record<string, unknown>);
+      expect(lines.filter((line) => line.event === "mcp_operation")).toEqual([]);
+    } finally {
+      signs.mockRestore();
+      sink.mockRestore();
+    }
+  });
+
+  test("mints on a session signed nine minutes ago", async () => {
+    await signInSecondsAgo(540);
+    const response = await POST(mintRequest());
+    expect(response.status).toBe(200);
+    expect(await verifyMcpToken(((await response.json()) as { token: string }).token)).toMatchObject({ sub: "bob" });
+  });
+
+  test("refuses a session that carries no issue time", async () => {
+    cookieStore = {
+      "auth-token": {
+        value: await new SignJWT({ username: "bob", role: "admin" })
+          .setProtectedHeader({ alg: "HS256" })
+          .setExpirationTime("1h")
+          .sign(getJwtSecret()),
+      },
+    };
+    const response = await POST(mintRequest());
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({ error: RECENT_SIGN_IN_REQUIRED });
+  });
 
   test("spends one slot of the query budget", async () => {
     process.env.RATE_LIMIT_QUERY_MAX = "1";
