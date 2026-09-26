@@ -266,7 +266,9 @@ describe("a cancel of a running call", () => {
   const failedRunEvents = () =>
     getServerAuditBuffer()
       .getAll()
-      .filter((event) => event.action === "run_read_query" && event.result === "failure");
+      .filter(
+        (event) => event.action === "run_read_query" && event.result === "failure" && event.reason === "mcp_cancelled",
+      );
 
   test("in the modern era reaches the handler through the request's signal, and no answer is delivered", async () => {
     const gate = gateMethod(DuckDBProvider.prototype, "queryReadOnly");

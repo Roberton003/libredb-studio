@@ -1,10 +1,64 @@
-import type { CallToolResult, McpServer } from "@modelcontextprotocol/server";
+import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
+import { AGENT_EXECUTION_ENGINES, namedList } from "@/lib/agent/engine-support";
+import { getDBConfig } from "@/lib/db-ui-config";
+import { ExecutionProfileError } from "@/lib/db/errors";
+import type { PreparedQuery } from "@/lib/db/types";
+import { logger } from "@/lib/logger";
+import type { ManagedConnection } from "@/lib/seed";
+import type { QueryResult } from "@/lib/types";
+import {
+  newMcpCorrelationId,
+  recordMcpDecision,
+  recordMcpOutcome,
+  type McpCallRecord,
+  type McpToolAuditReason,
+} from "../audit";
 import type { McpConnectionContext, McpToolCall } from "../context";
-import { assertReadOnlyStatement } from "../guards/execution-fence";
-import { safeJsonStringify, safeSerialize, redactErrorMessage } from "../serializer";
-import { emitAuditEvent } from "@/lib/audit";
-import { randomUUID } from "node:crypto";
+import { checkReadOnlyStatement } from "../guards/execution-fence";
+import {
+  engineError,
+  MCP_CANCELLED_TEXT,
+  MCP_ENGINE_ERROR_PREFIX,
+  MCP_NOT_VISIBLE_TEXT,
+  MCP_PROVIDER_BYTE_CAP,
+  MCP_PROVIDER_ROW_CAP,
+  MCP_READ_ONLY_ANNOTATIONS,
+  MCP_RESULT_CAP_BYTES,
+  MCP_UNTRUSTED_NOTICE,
+  ownWordsError,
+  recordOrRefuse,
+  untrustedResult,
+  withByteSize,
+  type ToolResult,
+} from "../output";
+import { redactError, safeSerialize } from "../serializer";
+import {
+  classifyReadQueryFailure,
+  fenceRefusalText,
+  MORE_ROWS_THAN_PAGEABLE_HINT,
+  nextPageHint,
+  offsetRefusalText,
+  profileRefusalText,
+  raceDeadline,
+  ROW_OVER_CAP_TEXT,
+  timeoutText,
+} from "./read-query-limits";
+
+/**
+ * run_read_query (#246): one read-only statement, on an engine that can bound it itself.
+ *
+ * The boundary is the agent-read-only acquisition and the provider's queryReadOnly, which the
+ * factory refuses to hand out for an engine without one; this module never calls query(), and that
+ * is what makes its readOnlyHint true. The execution fence runs first as defence in depth. One
+ * deadline, the call's start plus timeout_ms, covers acquisition and execution; neither a cancel
+ * nor the deadline stops a statement already running, they end the wait.
+ *
+ * Rows are fetched one past the page, so the extra row proves more exist, cut to max_rows, then
+ * cut to the result cap by binary search. offset on a query the provider did not rewrite is
+ * refused before anything runs, because the provider would answer the first page labelled with
+ * the requested offset.
+ */
 
 export const RunReadQueryInputSchema = z.object({
   connection_id: z.string().min(1, "connection_id is required"),
@@ -14,306 +68,173 @@ export const RunReadQueryInputSchema = z.object({
   timeout_ms: z.number().int().min(500).max(30000).default(10000),
 });
 
+const RunReadQueryOutputSchema = z.object({
+  connection_id: z.string(),
+  columns: z.array(z.object({ name: z.string(), type: z.string().optional() })),
+  rows: z.array(z.record(z.string(), z.unknown())),
+  row_count: z.number().int(),
+  truncated: z.boolean(),
+  truncated_by: z.enum(["max_rows", "result_bytes"]).nullable(),
+  pagination: z.object({
+    offset: z.number().int(),
+    limit: z.number().int(),
+    hasMore: z.boolean(),
+    nextOffset: z.number().int().nullable(),
+    wasLimited: z.boolean(),
+  }),
+  hint: z.string().nullable(),
+  byte_size: z.number().int(),
+  execution_time_ms: z.number(),
+});
+
 export type RunReadQueryInput = z.infer<typeof RunReadQueryInputSchema>;
 
-export interface QueryResultEnvelope {
-  connection_id: string;
-  rows: Array<Record<string, unknown>>;
-  row_count: number;
-  truncated: boolean;
-  byte_size: number;
-  execution_time_ms: number;
-  fields?: Array<{ name: string; type?: string }>;
-  pagination?: {
-    limit: number;
-    offset: number;
-    hasMore: boolean;
-    totalReturned: number;
-    wasLimited: boolean;
-  };
-}
+const RUN_READ_QUERY_TITLE = "Run a read-only query";
+/** Derived from the one engine list, as src/lib/agent/posture.ts derives its own sentence. */
+export const RUN_READ_QUERY_ENGINES = namedList(AGENT_EXECUTION_ENGINES.map((type) => getDBConfig(type).label));
+export const RUN_READ_QUERY_DESCRIPTION = `Run one read-only SQL statement on a connection: a SELECT (a WITH is fine), VALUES, TABLE, or EXPLAIN without ANALYZE. Runs on ${RUN_READ_QUERY_ENGINES}; other engines refuse it, so use inspect_schema there. Returns at most max_rows rows (default 100, at most 500) and at most 32 KiB; truncated and pagination.hasMore say when rows were cut, and pagination.nextOffset is the offset of the next page when the query can be paged. ${MCP_UNTRUSTED_NOTICE}`;
 
-const MAX_PAYLOAD_BYTES = 64 * 1024; // 64 KB defensive ceiling for LLMs
+/** A result, and the reason its outcome event records when it is a failure. */
+type Answer = readonly [ToolResult, McpToolAuditReason?];
 
 /**
- * Executes a read-only SQL query protected by acquireExecutionProfileProvider
- * and strict row, payload, and pagination limits.
+ * The answer to a step that failed. A failure answered as the timeout can be a real engine or
+ * connection error that settled after the deadline, so the provider's own message, redacted, goes
+ * to the server log with the call's correlation id, and never to the client.
  */
-async function runReadQuery(args: RunReadQueryInput, call: McpToolCall): Promise<CallToolResult> {
-  const startTime = Date.now();
-  const signal = call.signal;
-  const correlationId = randomUUID();
-
-  // 0. If request was already aborted by client before starting
-  if (signal.aborted) {
-    const reason = signal.reason || "Client cancelled request";
-    return {
-      isError: true,
-      content: [
-        {
-          type: "text",
-          text: `Execution cancelled: ${redactErrorMessage(reason instanceof Error ? reason.message : String(reason))}`,
-        },
-      ],
-    };
+function failureAnswer(
+  error: unknown,
+  settledAt: number,
+  deadline: number,
+  timeoutMs: number,
+  record: McpCallRecord,
+): Answer {
+  const failure = classifyReadQueryFailure(error, settledAt, deadline);
+  if (failure.kind === "timeout") {
+    logger.warn("MCP run_read_query answered a provider failure as the timeout", {
+      route: "/api/mcp",
+      error: redactError(error).message,
+      connection: record.connectionName,
+      correlationId: record.correlationId,
+    });
+    return [ownWordsError(timeoutText(timeoutMs)), "mcp_timeout"];
   }
+  if (failure.kind === "too-large") return [ownWordsError(failure.text), "mcp_result_too_large"];
+  return [engineError(MCP_ENGINE_ERROR_PREFIX, failure.error), "mcp_execution_failed"];
+}
 
-  const callerId = call.context.caller.username;
-  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
-  let onAbortReject: (() => void) | undefined;
-
-  try {
-    // 1. Fail-closed execution fence (Defense in depth: AST / Regex)
-    assertReadOnlyStatement(args.sql);
-
-    // 2. Canonical boundary: acquireExecutionProfileProvider with "agent-read-only" profile
-    const connection = await call.context.resolve(args.connection_id);
-    if (connection === null) throw new Error(`Connection not found: "${args.connection_id}"`);
-    const provider = await call.context.acquire(connection, "agent-read-only");
-
-    // If client aborted during provider acquisition/connection
-    if (signal.aborted) {
-      const reason = signal.reason || "Client cancelled request";
-      return {
-        isError: true,
-        content: [
-          {
-            type: "text",
-            text: `Execution cancelled: ${redactErrorMessage(reason instanceof Error ? reason.message : String(reason))}`,
-          },
-        ],
-      };
-    }
-
-    const startTime = Date.now();
-
-    // 3. Query preparation with pagination (Contract 0.16.2 / #816)
-    if (args.offset > 0) {
-      const supportsPagination =
-        typeof provider.getCapabilities === "function" &&
-        provider.getCapabilities().supportsResultPagination === true &&
-        typeof provider.prepareQuery === "function";
-
-      if (!supportsPagination) {
-        throw new Error(`Provider for connection "${args.connection_id}" does not support result pagination (offset)`);
-      }
-    }
-
-    const prepared =
-      typeof provider.prepareQuery === "function"
-        ? provider.prepareQuery(args.sql, { limit: args.max_rows, offset: args.offset })
-        : { query: args.sql, limit: args.max_rows, offset: args.offset, wasLimited: false };
-
-    // 4. Protected execution with timeout
-    const timeoutPromise = new Promise((_, reject) => {
-      timeoutHandle = setTimeout(() => {
-        reject(new Error(`Query execution timed out after ${args.timeout_ms}ms`));
-      }, args.timeout_ms);
-    });
-
-    const abortPromise = new Promise<never>((_, reject) => {
-      onAbortReject = () => {
-        const reason = signal.reason || "Query cancelled";
-        const message = reason instanceof Error ? reason.message : String(reason);
-        reject(new Error(`Execution cancelled: ${redactErrorMessage(message)}`));
-      };
-
-      if (signal.aborted) return onAbortReject();
-
-      signal.addEventListener("abort", onAbortReject, { once: true });
-    });
-
-    // Validate that the provider explicitly supports the database-native readOnlyProfile (#328)
-    if ((provider as any).readOnlyProfile !== true || typeof provider.queryReadOnly !== "function") {
-      throw new Error(
-        `Provider for connection "${args.connection_id}" does not support database-native read-only execution profile`,
-      );
-    }
-
-    const rawResult: any = await Promise.race([
-      provider.queryReadOnly(prepared.query, {
-        maxResultRows: prepared.limit,
-        statementTimeoutMs: args.timeout_ms,
-        maxResultBytes: MAX_PAYLOAD_BYTES,
-      }),
-      timeoutPromise,
-      abortPromise,
-    ]);
-
-    const executionTimeMs = Date.now() - startTime;
-    const rawRows = (rawResult.rows || []) as Array<Record<string, unknown>>;
-    const originalCount = rawRows.length;
-
-    // 5. Pagination and row capping (Contract 0.16.2)
-    const hasMore = prepared.wasLimited && originalCount === prepared.limit;
-    const cappedRows = rawRows.slice(0, prepared.limit);
-    let hasFieldTruncation = false;
-
-    // 6. Byte budget check with Safe Serializer and full wire envelope measurement
-    let safeRows = safeSerialize(cappedRows) as Array<Record<string, unknown>>;
-    let fields: Array<{ name: string }> | undefined = rawResult.fields?.map((f: unknown) => {
-      const rawName = typeof f === "string" ? f : String(f);
-      if (rawName.length > 64) {
-        hasFieldTruncation = true;
-        return { name: `${rawName.slice(0, 64)}... [TRUNCATED]` };
-      }
-      return { name: rawName };
-    });
-
-    let truncated = (prepared.wasLimited && hasMore) || originalCount > prepared.limit || hasFieldTruncation;
-
-    function truncateDeepValue(val: unknown, maxLen: number): unknown {
-      if (typeof val === "string") {
-        return val.length > maxLen ? `${val.slice(0, maxLen)}... [TRUNCATED]` : val;
-      }
-      if (val !== null && typeof val === "object") {
-        const str = safeJsonStringify(val);
-        if (str.length > maxLen) {
-          return `${str.slice(0, maxLen)}... [TRUNCATED OBJECT]`;
-        }
-      }
-      return val;
-    }
-
-    const buildEnvelopeCandidate = (
-      r: Array<Record<string, unknown>>,
-      f: Array<{ name: string }> | undefined,
-      isTruncated: boolean,
-    ) => {
-      const env: QueryResultEnvelope = {
-        connection_id: args.connection_id.length > 64 ? `${args.connection_id.slice(0, 64)}...` : args.connection_id,
-        rows: r,
-        row_count: r.length,
-        truncated: isTruncated,
+function resultOf(args: RunReadQueryInput, prepared: PreparedQuery, raw: QueryResult): Answer {
+  const all = safeSerialize(raw.rows);
+  const page = all.slice(0, args.max_rows);
+  const columns = raw.fields.map((name) => {
+    const type = raw.columnTypes?.[name];
+    return type === undefined ? { name } : { name, type };
+  });
+  const build = (count: number) => {
+    const truncatedBy = count < page.length ? "result_bytes" : all.length > args.max_rows ? "max_rows" : null;
+    const hasMore = all.length > count;
+    const nextOffset = hasMore && prepared.wasLimited ? args.offset + count : null;
+    return withByteSize(
+      {
+        connection_id: args.connection_id,
+        columns,
+        rows: page.slice(0, count),
+        row_count: count,
+        truncated: truncatedBy !== null,
+        truncated_by: truncatedBy,
+        pagination: { offset: args.offset, limit: args.max_rows, hasMore, nextOffset, wasLimited: prepared.wasLimited },
+        hint: nextOffset !== null ? nextPageHint(nextOffset) : hasMore ? MORE_ROWS_THAN_PAGEABLE_HINT : null,
         byte_size: 0,
-        execution_time_ms: executionTimeMs,
-        fields: f,
-        pagination: {
-          limit: prepared.limit,
-          offset: prepared.offset,
-          hasMore,
-          totalReturned: originalCount,
-          wasLimited: prepared.wasLimited,
-        },
-      };
+        execution_time_ms: raw.executionTime,
+      },
+      untrustedResult,
+    );
+  };
+  const whole = build(page.length);
+  if (whole.bytes <= MCP_RESULT_CAP_BYTES) return [whole.result];
+  let fits = 0;
+  let fails = page.length;
+  while (fails - fits > 1) {
+    const middle = Math.floor((fits + fails) / 2);
+    if (build(middle).bytes <= MCP_RESULT_CAP_BYTES) fits = middle;
+    else fails = middle;
+  }
+  return fits === 0 ? [ownWordsError(ROW_OVER_CAP_TEXT), "mcp_result_too_large"] : [build(fits).result];
+}
 
-      // Stabilize iterative byte_size calculation to match UTF-8 wire bytes
-      let txt = safeJsonStringify(env, 2);
-      for (let i = 0; i < 3; i++) {
-        const currentBytes = Buffer.byteLength(txt, "utf-8");
-        if (env.byte_size === currentBytes) break;
-        env.byte_size = currentBytes;
-        txt = safeJsonStringify(env, 2);
-      }
-      const finalBytes = Buffer.byteLength(txt, "utf-8");
-      const outerWireBytes = Buffer.byteLength(JSON.stringify(txt), "utf-8");
-      return { env, txt, wireBytes: Math.max(finalBytes, outerWireBytes) };
-    };
+async function execute(
+  args: RunReadQueryInput,
+  call: McpToolCall,
+  connection: ManagedConnection,
+  record: McpCallRecord,
+  deadline: number,
+): Promise<Answer> {
+  const acquired = await raceDeadline(() => call.context.acquire(connection, "agent-read-only"), call.signal, deadline);
+  if (acquired.kind === "cancelled") return [ownWordsError(MCP_CANCELLED_TEXT), "mcp_cancelled"];
+  if (acquired.kind === "timeout") return [ownWordsError(timeoutText(args.timeout_ms)), "mcp_timeout"];
+  if (acquired.kind === "failed") {
+    return acquired.error instanceof ExecutionProfileError
+      ? [ownWordsError(profileRefusalText(acquired.error.message, RUN_READ_QUERY_ENGINES)), "mcp_execution_failed"]
+      : failureAnswer(acquired.error, acquired.settledAt, deadline, args.timeout_ms, record);
+  }
+  const provider = acquired.value;
+  const queryReadOnly = provider.queryReadOnly?.bind(provider);
+  if (queryReadOnly === undefined) {
+    // The profile seam refuses such a provider, so this is a server fault; query() is never the fallback.
+    const refusal = profileRefusalText(
+      "the acquired provider exposes no read-only execution path",
+      RUN_READ_QUERY_ENGINES,
+    );
+    return [ownWordsError(refusal), "mcp_execution_failed"];
+  }
+  const prepared = provider.prepareQuery(args.sql, { limit: args.max_rows + 1, offset: args.offset });
+  if (!prepared.wasLimited && args.offset > 0) {
+    return [ownWordsError(offsetRefusalText(args.sql, connection.type)), "mcp_offset_unsupported"];
+  }
+  const executed = await raceDeadline(
+    () =>
+      queryReadOnly(prepared.query, {
+        maxResultRows: MCP_PROVIDER_ROW_CAP,
+        maxResultBytes: MCP_PROVIDER_BYTE_CAP,
+        statementTimeoutMs: Math.max(1, Math.floor(deadline - Date.now())),
+      }),
+    call.signal,
+    deadline,
+  );
+  if (executed.kind === "cancelled") return [ownWordsError(MCP_CANCELLED_TEXT), "mcp_cancelled"];
+  if (executed.kind === "timeout") return [ownWordsError(timeoutText(args.timeout_ms)), "mcp_timeout"];
+  if (executed.kind === "failed") {
+    return failureAnswer(executed.error, executed.settledAt, deadline, args.timeout_ms, record);
+  }
+  return resultOf(args, prepared, executed.value);
+}
 
-    let candidate = buildEnvelopeCandidate(safeRows, fields, truncated);
+export async function runReadQuery(args: RunReadQueryInput, call: McpToolCall): Promise<ToolResult> {
+  const startedAt = Date.now();
+  const deadline = startedAt + args.timeout_ms;
+  const record: McpCallRecord = {
+    action: "run_read_query",
+    user: call.context.caller.username,
+    correlationId: newMcpCorrelationId(),
+  };
+  const refuse = (target: McpCallRecord, reason: McpToolAuditReason, text: string) =>
+    recordOrRefuse(() => recordMcpDecision(target, reason)) ?? ownWordsError(text);
 
-    if (candidate.wireBytes > MAX_PAYLOAD_BYTES) {
-      // Step A: If more than 50 metadata fields exist, cap them to protect the wire budget
-      if (fields && fields.length > 50) {
-        fields = [
-          ...fields.slice(0, 50),
-          { name: `... [TRUNCATED: ${fields.length - 50} additional columns omitted]` },
-        ];
-        truncated = true;
-        candidate = buildEnvelopeCandidate(safeRows, fields, truncated);
-      }
+  if (call.signal.aborted) return refuse(record, "mcp_cancelled", MCP_CANCELLED_TEXT);
+  const connection = await call.context.resolve(args.connection_id);
+  if (connection === null) return refuse(record, "mcp_connection_not_visible", MCP_NOT_VISIBLE_TEXT);
+  const resolved: McpCallRecord = { ...record, connectionName: connection.seedId };
+  const violation = checkReadOnlyStatement(args.sql);
+  if (violation !== null) return refuse(resolved, "mcp_statement_refused", fenceRefusalText(violation));
+  const unrecorded = recordOrRefuse(() => recordMcpDecision(resolved));
+  if (unrecorded !== null) return unrecorded;
 
-      // Step B: Geometric row reduction (75% per iteration)
-      while (safeRows.length > 1 && candidate.wireBytes > MAX_PAYLOAD_BYTES) {
-        safeRows = safeRows.slice(0, Math.floor(safeRows.length * 0.75));
-        truncated = true;
-        candidate = buildEnvelopeCandidate(safeRows, fields, truncated);
-      }
-
-      // Step C: Truncate deep strings, keys, and objects (256 -> 128 -> 64 -> 32 -> 16)
-      if (candidate.wireBytes > MAX_PAYLOAD_BYTES && safeRows.length > 0) {
-        let maxFieldLen = 256;
-        while (candidate.wireBytes > MAX_PAYLOAD_BYTES && maxFieldLen >= 16) {
-          const maxKeyLen = Math.max(32, maxFieldLen);
-          safeRows = safeRows.map((row) => {
-            const trimmed: Record<string, unknown> = {};
-            for (const [k, v] of Object.entries(row)) {
-              const safeKey = k.length > maxKeyLen ? `${k.slice(0, maxKeyLen)}...` : k;
-              trimmed[safeKey] = truncateDeepValue(v, maxFieldLen);
-            }
-            return trimmed;
-          });
-          truncated = true;
-          candidate = buildEnvelopeCandidate(safeRows, fields, truncated);
-          maxFieldLen = Math.floor(maxFieldLen / 2);
-        }
-      }
-
-      // Step D: If still exceeding 64 KiB, prune excess columns in rows and metadata
-      if (candidate.wireBytes > MAX_PAYLOAD_BYTES && safeRows.length > 0) {
-        safeRows = safeRows.map((row) => {
-          const entries = Object.entries(row);
-          const cappedEntries = entries.slice(0, Math.min(entries.length, 25));
-          const trimmed: Record<string, unknown> = Object.fromEntries(cappedEntries);
-          trimmed["_truncation_warning"] = "[TRUNCATED: excess columns omitted to respect 64 KB wire budget]";
-          return trimmed;
-        });
-        if (fields && fields.length > 25) {
-          fields = [...fields.slice(0, 25), { name: "... [TRUNCATED: excess columns omitted]" }];
-        }
-        truncated = true;
-        candidate = buildEnvelopeCandidate(safeRows, fields, truncated);
-      }
-    }
-
-    emitAuditEvent({
-      type: "agent_operation",
-      action: "run_read_query",
-      target: args.connection_id,
-      user: callerId,
-      result: "success",
-      duration: executionTimeMs,
-      correlationId,
-    });
-
-    return {
-      content: [
-        {
-          type: "text",
-          text: candidate.txt,
-        },
-      ],
-    };
-  } catch (error: any) {
-    if (args.connection_id) {
-      emitAuditEvent({
-        type: "agent_operation",
-        action: "run_read_query",
-        target: args.connection_id,
-        user: callerId,
-        result: "failure",
-        reason: "agent_execution_failed",
-        duration: Date.now() - startTime,
-        correlationId,
-      });
-    }
-
-    return {
-      isError: true,
-      content: [
-        {
-          type: "text",
-          text: `Execution failed: ${redactErrorMessage(error?.message || String(error))}`,
-        },
-      ],
-    };
-  } finally {
-    if (timeoutHandle) {
-      clearTimeout(timeoutHandle);
-    }
-    if (onAbortReject) {
-      signal.removeEventListener("abort", onAbortReject);
-    }
+  const finish = ([result, failure]: Answer): ToolResult =>
+    recordOrRefuse(() => recordMcpOutcome(resolved, Date.now() - startedAt, failure)) ?? result;
+  try {
+    return finish(await execute(args, call, connection, resolved, deadline));
+  } catch (error) {
+    return finish([engineError(MCP_ENGINE_ERROR_PREFIX, error), "mcp_execution_failed"]);
   }
 }
 
@@ -321,9 +242,11 @@ export function registerRunReadQuery(server: McpServer, context: McpConnectionCo
   server.registerTool(
     "run_read_query",
     {
-      description:
-        "Execute a strictly read-only SQL query (SELECT / WITH) with strict execution guardrails and timeouts.",
+      title: RUN_READ_QUERY_TITLE,
+      description: RUN_READ_QUERY_DESCRIPTION,
       inputSchema: RunReadQueryInputSchema,
+      outputSchema: RunReadQueryOutputSchema,
+      annotations: MCP_READ_ONLY_ANNOTATIONS,
     },
     (args, ctx) => runReadQuery(args, { context, signal: ctx.mcpReq.signal }),
   );
