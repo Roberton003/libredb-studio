@@ -19,12 +19,15 @@ import {
   mcpUrlFor,
   parseLauncherArgs,
   parseSha256Sums,
+  PATH_VARIABLES,
   preservePayloadData,
   releaseDownloadUrl,
   resolveBindAddress,
   resolveCacheDir,
   resolveLedgerDir,
+  resolvePathVariables,
   sha256File,
+  URL_PATH_VARIABLES,
 } from "../../bin/lib/launcher-utils.mjs";
 import { describeIf, missingUnixTool, resolveUnixTool } from "../helpers/posix-tools";
 
@@ -693,6 +696,68 @@ describe("resolveBindAddress (issue #813)", () => {
  * @mikevillari in #709 and removed there while that job still ran on the runner's
  * default Node 22.
  */
+describe("resolvePathVariables", () => {
+  const cwd = path.resolve(tempDir, "invoked-from");
+
+  test.each(PATH_VARIABLES.map((name) => [name]))("resolves a relative %s against the invoking directory", (name) => {
+    expect(resolvePathVariables({ [name]: "./data/x" }, cwd)[name]).toBe(path.join(cwd, "data", "x"));
+  });
+
+  test("resolves a bare relative name, not only one starting with ./", () => {
+    expect(resolvePathVariables({ SEED_CONFIG_PATH: "seed.yaml" }, cwd).SEED_CONFIG_PATH).toBe(
+      path.join(cwd, "seed.yaml"),
+    );
+  });
+
+  test("leaves an absolute value untouched", () => {
+    const absolute = path.resolve(os.tmpdir(), "seed.yaml");
+    expect(resolvePathVariables({ SEED_CONFIG_PATH: absolute }, cwd).SEED_CONFIG_PATH).toBe(absolute);
+  });
+
+  test.each([[""], ["   "]])(
+    "leaves an empty value %p untouched, so the server's own default still applies",
+    (value) => {
+      expect(resolvePathVariables({ STORAGE_SQLITE_PATH: value }, cwd).STORAGE_SQLITE_PATH).toBe(value);
+    },
+  );
+
+  test("never resolves a URL path, even a relative-looking one", () => {
+    const env = { BASE_PATH: "tools/libredb", NEXT_PUBLIC_MONACO_VS_PATH: "monaco/vs", SEED_CONFIG_PATH: "s.yaml" };
+    const resolved = resolvePathVariables(env, cwd);
+    expect(resolved.BASE_PATH).toBe("tools/libredb");
+    expect(resolved.NEXT_PUBLIC_MONACO_VS_PATH).toBe("monaco/vs");
+    // The control: the same call did resolve a filesystem path.
+    expect(resolved.SEED_CONFIG_PATH).toBe(path.join(cwd, "s.yaml"));
+  });
+
+  test("copies every other variable through and does not mutate its input", () => {
+    const env = { SEED_CONFIG_PATH: "s.yaml", JWT_SECRET: "./not-a-path" };
+    const resolved = resolvePathVariables(env, cwd);
+    expect(resolved.JWT_SECRET).toBe("./not-a-path");
+    expect(resolved).not.toHaveProperty("STORAGE_SQLITE_PATH");
+    expect(env.SEED_CONFIG_PATH).toBe("s.yaml");
+  });
+
+  /*
+    The guard that keeps the list honest: a new *_PATH, *_DIR or *_FILE variable documented in
+    .env.example must be classified here, either resolved (PATH_VARIABLES) or left alone with a
+    reason (URL_PATH_VARIABLES), so it cannot silently keep the old cwd-relative behaviour.
+  */
+  test("every *_PATH, *_DIR or *_FILE variable in .env.example is classified", () => {
+    const example = fs.readFileSync(path.resolve(import.meta.dir, "../../.env.example"), "utf8");
+    const documented = [...example.matchAll(/^#?\s*([A-Z][A-Z0-9_]*_(?:PATH|DIR|FILE))=/gm)].map((m) => m[1]);
+    // The control: the pattern does find the variables this fix was written for.
+    expect(documented).toContain("SEED_CONFIG_PATH");
+    expect(documented).toContain("BASE_PATH");
+    const classified = new Set([...PATH_VARIABLES, ...Object.keys(URL_PATH_VARIABLES)]);
+    expect(documented.filter((name) => !classified.has(name))).toEqual([]);
+  });
+
+  test("no variable is both resolved and excluded", () => {
+    expect(PATH_VARIABLES.filter((name) => Object.hasOwn(URL_PATH_VARIABLES, name))).toEqual([]);
+  });
+});
+
 describe("launcher startup URL", () => {
   test.each([
     ["0.0.0.0", "http://127.0.0.1:3000"],
@@ -880,5 +945,51 @@ describe("launcher MCP URL", () => {
   test("leaves an operator's own LIBREDB_MCP_URL untouched", () => {
     const own = "https://studio.example.com/tools/libredb/api/mcp";
     expect(launch(["--port", "4123"], { LIBREDB_MCP_URL: own })).toContain(`MCP_URL=${own}\n`);
+  });
+});
+
+/**
+ * Relative path variables, read back from a real launcher process started from a directory of the
+ * test's choosing, on the harness of `launcher bind address` above. This is the reported shape: the
+ * server runs with its cwd in the payload cache, so SEED_CONFIG_PATH=./seed-connections.yaml used to
+ * point into the cache and seed connections were silently skipped.
+ */
+describe("launcher path variables", () => {
+  test("resolves a relative path against the directory the launcher was run from", () => {
+    const node = Bun.which("node");
+    expect(node).not.toBeNull();
+    const ambient = Bun.spawnSync([node!, "-p", "process.versions.node"]).stdout.toString().trim();
+    expect(assessNodeRuntime(ambient).message).toBeNull();
+
+    const home = fs.mkdtempSync(path.join(tempDir, "path-vars-"));
+    const invokedFrom = fs.mkdtempSync(path.join(tempDir, "invoked-"));
+    const root = path.resolve(import.meta.dir, "../..");
+    const version = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")).version;
+    const payload = path.join(home, ".libredb-studio", version, "payload");
+    fs.mkdirSync(payload, { recursive: true });
+    fs.writeFileSync(
+      path.join(payload, "server.js"),
+      'console.log("SEED=" + process.env.SEED_CONFIG_PATH); console.log("BASE=" + process.env.BASE_PATH);',
+    );
+    const preload = path.join(home, "home-fixture.mjs");
+    fs.writeFileSync(
+      preload,
+      'import os from "node:os"; import { syncBuiltinESMExports } from "node:module"; ' +
+        `os.homedir = () => ${JSON.stringify(home)}; syncBuiltinESMExports();`,
+    );
+    const env = { ...process.env };
+    for (const name of ["PORT", "LIBREDB_STUDIO_ARCHIVE", "LIBREDB_BIND", "HOSTNAME"]) delete env[name];
+    Object.assign(env, { SEED_CONFIG_PATH: "./seed-connections.yaml", BASE_PATH: "/tools/libredb" });
+    const run = Bun.spawnSync([node!, "--import", pathToFileURL(preload).href, path.join(root, "bin/studio.js")], {
+      cwd: invokedFrom,
+      env,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    expect(run.exitCode, `launcher stderr: ${run.stderr.toString()}`).toBe(0);
+    const output = run.stdout.toString();
+    // realpath: on macOS the temp directory is a symlink, and process.cwd() reports its target.
+    expect(output).toContain(`SEED=${path.join(fs.realpathSync(invokedFrom), "seed-connections.yaml")}\n`);
+    expect(output).toContain("BASE=/tools/libredb\n");
   });
 });
