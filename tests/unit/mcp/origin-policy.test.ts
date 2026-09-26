@@ -1,8 +1,8 @@
 /**
  * The MCP endpoint's Origin and Host gate (#246). Origin is checked on every method and every
  * bind; Host only when HOSTNAME is a loopback address, which is where DNS rebinding reaches a
- * local server. The allowlists come from the localhost names, the canonical LIBREDB_MCP_URL and
- * ALLOWED_ORIGINS, and never from the request's Host or X-Forwarded-Host.
+ * local server. The allowlists come from the localhost names and ALLOWED_ORIGINS, the Host list
+ * also from the canonical LIBREDB_MCP_URL, and never from the request's Host or X-Forwarded-Host.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { configuredOriginHostnames, resetOriginCheckWarnings } from "@/lib/api/origin-check";
@@ -82,17 +82,16 @@ describe("the allowlists", () => {
     expect(mcpHostAllowlist()).toEqual(["localhost", "127.0.0.1", "[::1]"]);
   });
 
-  test("add the canonical URL's host and the ALLOWED_ORIGINS hosts", () => {
+  test("add the ALLOWED_ORIGINS hosts to both, and the canonical URL's host to the Host list only", () => {
     process.env[MCP_URL_ENV] = "https://studio.example/api/mcp";
     process.env.ALLOWED_ORIGINS = "https://proxy.example:8443";
-    const expected = ["localhost", "127.0.0.1", "[::1]", "studio.example", "proxy.example"];
-    expect(mcpOriginAllowlist()).toEqual(expected);
-    expect(mcpHostAllowlist()).toEqual(expected);
+    expect(mcpOriginAllowlist()).toEqual(["localhost", "127.0.0.1", "[::1]", "proxy.example"]);
+    expect(mcpHostAllowlist()).toEqual(["localhost", "127.0.0.1", "[::1]", "studio.example", "proxy.example"]);
   });
 
   test("ignore an invalid LIBREDB_MCP_URL", () => {
     process.env[MCP_URL_ENV] = "https://studio.example/elsewhere";
-    expect(mcpOriginAllowlist()).toEqual(["localhost", "127.0.0.1", "[::1]"]);
+    expect(mcpHostAllowlist()).toEqual(["localhost", "127.0.0.1", "[::1]"]);
   });
 });
 
@@ -155,11 +154,23 @@ describe("mcpOriginHostRefusal", () => {
     expect(mcpOriginHostRefusal(request({ host }))).toBeNull();
   });
 
-  test("passes the canonical URL's host and an ALLOWED_ORIGINS host with its port", () => {
+  test("passes the canonical URL's host as Host, and an ALLOWED_ORIGINS host with its port as Origin and Host", () => {
     process.env[MCP_URL_ENV] = "https://studio.example/api/mcp";
     process.env.ALLOWED_ORIGINS = "https://proxy.example:8443";
-    expect(mcpOriginHostRefusal(request({ origin: "https://studio.example", host: "studio.example" }))).toBeNull();
-    expect(mcpOriginHostRefusal(request({ host: "proxy.example:8443" }))).toBeNull();
+    expect(mcpOriginHostRefusal(request({ host: "studio.example" }))).toBeNull();
+    expect(
+      mcpOriginHostRefusal(request({ origin: "https://proxy.example:8443", host: "proxy.example:8443" })),
+    ).toBeNull();
+  });
+
+  test("answers the canonical URL's own Origin the same with and without LIBREDB_MCP_URL", async () => {
+    // An unauthenticated caller must not learn from the answer whether MCP is configured.
+    const probe = () => mcpOriginHostRefusal(request({ origin: "https://studio.example", host: "localhost:3000" }));
+    const unset = probe();
+    process.env[MCP_URL_ENV] = "https://studio.example/api/mcp";
+    const set = probe();
+    expect([unset?.reason, set?.reason]).toEqual(["origin_mismatch", "origin_mismatch"]);
+    expect(await refusalBody(set)).toEqual(await refusalBody(unset));
   });
 
   test("the control: on a non-loopback bind a foreign Host is not this gate's to refuse", () => {

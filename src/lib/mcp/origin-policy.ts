@@ -14,10 +14,13 @@ import { readMcpUrl } from "./config";
  * Origin runs on every method, GET included, which checkOrigin exempts, because the transport's
  * Origin rule binds every connection. Host runs only on a loopback bind, where DNS rebinding is
  * what reaches a local server; containers resolve HOSTNAME to "::" or 0.0.0.0 and rely on the
- * Origin check and the token. The allowlists are the localhost names, the canonical URL's host
- * and the ALLOWED_ORIGINS hosts, never the request's Host or X-Forwarded-Host, which under
- * rebinding carry the attacker's name. The SDK's validators ignore ports, refuse a present but
- * unparseable Origin, and refuse a missing Host.
+ * Origin check and the token. The allowlists are the localhost names and the ALLOWED_ORIGINS hosts,
+ * never the request's Host or X-Forwarded-Host, which under rebinding carry the attacker's name.
+ * The Host list also takes the canonical URL's host; the Origin list does not, because it runs
+ * before the token, and an answer that changed with LIBREDB_MCP_URL would tell an unauthenticated
+ * caller whether MCP is configured. MCP clients are not browsers and send no Origin, so only a
+ * browser-based client needs its origin in ALLOWED_ORIGINS. The SDK's validators ignore ports,
+ * refuse a present but unparseable Origin, and refuse a missing Host.
  */
 
 export const MCP_LOOPBACK_BINDS: ReadonlySet<string> = new Set(["127.0.0.1", "::1", "localhost"]);
@@ -43,7 +46,7 @@ function canonicalHostnames(): string[] {
 }
 
 export function mcpOriginAllowlist(): string[] {
-  return [...localhostAllowedOrigins(), ...canonicalHostnames(), ...configuredOriginHostnames()];
+  return [...localhostAllowedOrigins(), ...configuredOriginHostnames()];
 }
 
 export function mcpHostAllowlist(): string[] {

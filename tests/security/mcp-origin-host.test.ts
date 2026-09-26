@@ -92,12 +92,29 @@ describe("through proxy(), Origin on every method", () => {
     expect((await proxy(originHostRequest("GET", { host: "localhost:3000" }))).status).toBe(401);
   });
 
-  test("the canonical URL's own Origin and Host pass both Origin checks", async () => {
+  test("the canonical URL's own Origin gets the same 403 with and without LIBREDB_MCP_URL", async () => {
+    // An unauthenticated caller must not learn from the answer whether MCP is configured.
+    const probe = () => proxy(originHostRequest("GET", { origin: "https://studio.example", host: "studio.example" }));
+    restoreChannel();
+    restoreChannel = useMcpChannel({ url: null });
+    const unset = await probe();
     restoreChannel();
     restoreChannel = useMcpChannel({ url: "https://studio.example/api/mcp" });
-    expect(
-      (await proxy(originHostRequest("GET", { origin: "https://studio.example", host: "studio.example" }))).status,
-    ).toBe(401);
+    const set = await probe();
+    expect([unset.status, set.status]).toEqual([403, 403]);
+    expect(await set.text()).toBe(await unset.text());
+  });
+
+  test("the control: an ALLOWED_ORIGINS host passes the Origin check with and without LIBREDB_MCP_URL", async () => {
+    process.env.ALLOWED_ORIGINS = "https://studio.example";
+    const probe = () => proxy(originHostRequest("GET", { origin: "https://studio.example", host: "studio.example" }));
+    restoreChannel();
+    restoreChannel = useMcpChannel({ url: null });
+    const unset = await probe();
+    restoreChannel();
+    restoreChannel = useMcpChannel({ url: "https://studio.example/api/mcp" });
+    const set = await probe();
+    expect([unset.status, set.status]).toEqual([401, 401]);
   });
 
   test("with LIBREDB_MCP_URL unset, a localhost Origin passes and another host's does not", async () => {
