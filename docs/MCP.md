@@ -296,5 +296,6 @@ In `opencode.json`, as a remote server ([OpenCode's MCP servers page](https://op
 | 400 `-32020` | A required `MCP-Protocol-Version`, `Mcp-Method` or `Mcp-Name` header is missing, malformed or disagrees with the body |
 | 500 | An unrecognized `LIBREDB_MCP_ENABLED`, an unset server version, or a server fault such as a missing `JWT_SECRET`; the server log names which |
 
-Every tool call writes `mcp_operation` audit events: a decision before any database is reached and an outcome after it, under one correlation id, with the token's user and the connection's seed id.
+A tool call that reaches a database writes two `mcp_operation` audit events: a decision before the database is reached and an outcome after it, under one correlation id, with the token's user and the connection's seed id.
+`list_connections` reaches no database, so it writes one event.
 A call whose audit record cannot be written is not run.
