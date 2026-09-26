@@ -123,11 +123,16 @@ function headerRefusal(request: Request, id: JsonRpcId): Response | null {
   return null;
 }
 
-/** Step 8: the SDK's own validation of `arguments ?? {}`, on the same schema object, verdict only. */
+/**
+ * Step 8: the SDK's own validation of `arguments ?? {}`, on the same schema object, verdict only.
+ * Arguments that are present but not a plain object never reach it: the SDK's tools/call request
+ * schema refuses them first, so there is no tool validation error to record.
+ */
 async function invalidArgumentsTool(body: Record<string, unknown>): Promise<McpToolName | null> {
   if (body.method !== "tools/call" || !isPlainObject(body.params)) return null;
   const { name, arguments: args } = body.params;
   if (!isMcpToolName(name)) return null;
+  if (args !== undefined && !isPlainObject(args)) return null;
   const verdict = await MCP_TOOL_INPUT_SCHEMAS[name]["~standard"].validate(args ?? {});
   return verdict.issues !== undefined && verdict.issues.length > 0 ? name : null;
 }

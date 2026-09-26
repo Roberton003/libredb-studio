@@ -313,6 +313,13 @@ describe("steps 1 to 8", () => {
     ["valid arguments", { name: "run_read_query", arguments: { connection_id: "seed:shop", sql: "SELECT 1" } }],
     ["an unknown tool", { name: "no_such_tool", arguments: { max_rows: 999 } }],
     ["no arguments for a tool that needs none", { name: "list_connections" }],
+    [
+      "arguments that are null, which the SDK's request schema refuses first",
+      { name: "run_read_query", arguments: null },
+    ],
+    ["arguments that are a string", { name: "run_read_query", arguments: "SELECT 1" }],
+    ["arguments that are an array", { name: "inspect_schema", arguments: [] }],
+    ["null arguments to a tool that needs none", { name: "list_connections", arguments: null }],
   ])("step 8 records nothing for %s", async (_name, params) => {
     expect((await dispatched(legacy({ id: 1, method: "tools/call", params }))).invalidArgumentsTool).toBeNull();
   });

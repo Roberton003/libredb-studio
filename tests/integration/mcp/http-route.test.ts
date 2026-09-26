@@ -564,4 +564,19 @@ describe("an argument refusal the SDK answers is recorded by the route", () => {
     expect(gated.status).toBe(400);
     expect(mcpEvents()).toEqual([]);
   });
+
+  test.each([
+    ["run_read_query", null],
+    ["run_read_query", "SELECT 1"],
+    ["inspect_schema", []],
+    ["list_connections", null],
+  ])(
+    "%s with arguments %p is refused by the SDK's request schema on HTTP 200, and writes no event for any tool",
+    async (tool, args) => {
+      const body = { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: tool, arguments: args } };
+      const reply = await readJsonRpc(await serve(legacyPost(body, { token })));
+      expect(reply.error?.code).toBe(-32602);
+      expect(mcpEvents()).toEqual([]);
+    },
+  );
 });
