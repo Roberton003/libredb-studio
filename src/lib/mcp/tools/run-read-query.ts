@@ -1,41 +1,51 @@
-import type { McpConnectionContext } from "../context";
-import type { McpCancellationManager } from "../guards/cancellation";
+import type { CallToolResult, McpServer } from "@modelcontextprotocol/server";
+import { z } from "zod";
+import type { McpConnectionContext, McpToolCall } from "../context";
 import { assertReadOnlyStatement } from "../guards/execution-fence";
 import { safeJsonStringify, safeSerialize, redactErrorMessage } from "../serializer";
-import {
-  type McpCallResult,
-  type QueryResultEnvelope,
-  type RunReadQueryInput,
-  RunReadQueryInputSchema,
-} from "../types";
 import { emitAuditEvent } from "@/lib/audit";
 import { randomUUID } from "node:crypto";
 
-const MAX_PAYLOAD_BYTES = 64 * 1024; // 64 KB defensive ceiling for LLMs
+export const RunReadQueryInputSchema = z.object({
+  connection_id: z.string().min(1, "connection_id is required"),
+  sql: z.string().min(1, "SQL cannot be empty"),
+  max_rows: z.number().int().min(1).max(500).default(100),
+  offset: z.number().int().min(0).default(0),
+  timeout_ms: z.number().int().min(500).max(30000).default(10000),
+});
 
-export interface RunReadQueryOptions {
-  requestId?: string | number | null;
-  callerId?: string | null;
-  signal?: AbortSignal;
-  cancellationManager?: McpCancellationManager;
+export type RunReadQueryInput = z.infer<typeof RunReadQueryInputSchema>;
+
+export interface QueryResultEnvelope {
+  connection_id: string;
+  rows: Array<Record<string, unknown>>;
+  row_count: number;
+  truncated: boolean;
+  byte_size: number;
+  execution_time_ms: number;
+  fields?: Array<{ name: string; type?: string }>;
+  pagination?: {
+    limit: number;
+    offset: number;
+    hasMore: boolean;
+    totalReturned: number;
+    wasLimited: boolean;
+  };
 }
+
+const MAX_PAYLOAD_BYTES = 64 * 1024; // 64 KB defensive ceiling for LLMs
 
 /**
  * Executes a read-only SQL query protected by acquireExecutionProfileProvider
  * and strict row, payload, and pagination limits.
  */
-export async function executeRunReadQuery(
-  rawArgs: unknown,
-  context: McpConnectionContext,
-  opts?: RunReadQueryOptions,
-): Promise<McpCallResult> {
+async function runReadQuery(args: RunReadQueryInput, call: McpToolCall): Promise<CallToolResult> {
   const startTime = Date.now();
-  const signal = opts?.signal;
-  const cancellationManager = opts?.cancellationManager;
+  const signal = call.signal;
   const correlationId = randomUUID();
 
   // 0. If request was already aborted by client before starting
-  if (signal?.aborted) {
+  if (signal.aborted) {
     const reason = signal.reason || "Client cancelled request";
     return {
       isError: true,
@@ -48,58 +58,22 @@ export async function executeRunReadQuery(
     };
   }
 
-  let args: RunReadQueryInput;
-  let parsedArgs: RunReadQueryInput | undefined;
-  try {
-    args = RunReadQueryInputSchema.parse(rawArgs);
-    parsedArgs = args;
-  } catch (err: any) {
-    return {
-      isError: true,
-      content: [
-        {
-          type: "text",
-          text: `Invalid parameters: ${err?.message || String(err)}`,
-        },
-      ],
-    };
-  }
-
-  const reqId = opts?.requestId !== undefined && opts?.requestId !== null ? opts.requestId : crypto.randomUUID();
-  const callerId = opts?.callerId || "anonymous";
+  const callerId = call.context.caller.username;
   let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
-  let onParentAbort: (() => void) | undefined;
   let onAbortReject: (() => void) | undefined;
-  let cancelSignal: AbortSignal | undefined;
-  let providerRef: any = null;
 
   try {
     // 1. Fail-closed execution fence (Defense in depth: AST / Regex)
     assertReadOnlyStatement(args.sql);
 
-    // Register in cancellationManager BEFORE provider acquisition so early cancellation is captured
-    if (cancellationManager) {
-      cancelSignal = cancellationManager.register(callerId, reqId, args.connection_id, async () => {
-        if (providerRef && typeof providerRef.cancelQuery === "function") {
-          await providerRef.cancelQuery(reqId);
-        }
-      });
-
-      if (signal) {
-        onParentAbort = () => {
-          void cancellationManager.handleCancellation(callerId, reqId, signal.reason);
-        };
-        signal.addEventListener("abort", onParentAbort, { once: true });
-      }
-    }
-
     // 2. Canonical boundary: acquireExecutionProfileProvider with "agent-read-only" profile
-    const provider = await context.getProvider(args.connection_id, "agent-read-only");
-    providerRef = provider;
+    const connection = await call.context.resolve(args.connection_id);
+    if (connection === null) throw new Error(`Connection not found: "${args.connection_id}"`);
+    const provider = await call.context.acquire(connection, "agent-read-only");
 
     // If client aborted during provider acquisition/connection
-    if (signal?.aborted || cancelSignal?.aborted) {
-      const reason = cancelSignal?.reason || signal?.reason || "Client cancelled request";
+    if (signal.aborted) {
+      const reason = signal.reason || "Client cancelled request";
       return {
         isError: true,
         content: [
@@ -133,25 +107,20 @@ export async function executeRunReadQuery(
     // 4. Protected execution with timeout
     const timeoutPromise = new Promise((_, reject) => {
       timeoutHandle = setTimeout(() => {
-        if (cancellationManager) {
-          void cancellationManager.handleCancellation(callerId, reqId, `Timeout after ${args.timeout_ms}ms`);
-        }
         reject(new Error(`Query execution timed out after ${args.timeout_ms}ms`));
       }, args.timeout_ms);
     });
 
     const abortPromise = new Promise<never>((_, reject) => {
       onAbortReject = () => {
-        const reason = cancelSignal?.reason || signal?.reason || "Query cancelled";
+        const reason = signal.reason || "Query cancelled";
         const message = reason instanceof Error ? reason.message : String(reason);
         reject(new Error(`Execution cancelled: ${redactErrorMessage(message)}`));
       };
 
-      if (signal?.aborted) return onAbortReject();
-      if (cancelSignal?.aborted) return onAbortReject();
+      if (signal.aborted) return onAbortReject();
 
-      signal?.addEventListener("abort", onAbortReject, { once: true });
-      cancelSignal?.addEventListener("abort", onAbortReject, { once: true });
+      signal.addEventListener("abort", onAbortReject, { once: true });
     });
 
     // Validate that the provider explicitly supports the database-native readOnlyProfile (#328)
@@ -316,11 +285,11 @@ export async function executeRunReadQuery(
       ],
     };
   } catch (error: any) {
-    if (parsedArgs?.connection_id) {
+    if (args.connection_id) {
       emitAuditEvent({
         type: "agent_operation",
         action: "run_read_query",
-        target: parsedArgs.connection_id,
+        target: args.connection_id,
         user: callerId,
         result: "failure",
         reason: "agent_execution_failed",
@@ -342,15 +311,20 @@ export async function executeRunReadQuery(
     if (timeoutHandle) {
       clearTimeout(timeoutHandle);
     }
-    if (signal && onParentAbort) {
-      signal.removeEventListener("abort", onParentAbort);
-    }
     if (onAbortReject) {
-      signal?.removeEventListener("abort", onAbortReject);
-      cancelSignal?.removeEventListener("abort", onAbortReject);
-    }
-    if (cancellationManager) {
-      cancellationManager.deregister(callerId, reqId);
+      signal.removeEventListener("abort", onAbortReject);
     }
   }
+}
+
+export function registerRunReadQuery(server: McpServer, context: McpConnectionContext): void {
+  server.registerTool(
+    "run_read_query",
+    {
+      description:
+        "Execute a strictly read-only SQL query (SELECT / WITH) with strict execution guardrails and timeouts.",
+      inputSchema: RunReadQueryInputSchema,
+    },
+    (args, ctx) => runReadQuery(args, { context, signal: ctx.mcpReq.signal }),
+  );
 }

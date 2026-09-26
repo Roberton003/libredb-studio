@@ -1,36 +1,65 @@
-import type { McpConnectionContext } from "../context";
+import type { CallToolResult, McpServer } from "@modelcontextprotocol/server";
+import { z } from "zod";
+import type { McpConnectionContext, McpToolCall } from "../context";
 import { safeJsonStringify, redactErrorMessage } from "../serializer";
-import {
-  type InspectSchemaInput,
-  InspectSchemaInputSchema,
-  type McpCallResult,
-  type SchemaInspectionResult,
-} from "../types";
 import { emitAuditEvent } from "@/lib/audit";
 import { randomUUID } from "node:crypto";
 
-export interface InspectSchemaOptions {
-  callerId?: string | null;
+export const InspectSchemaInputSchema = z.object({
+  connection_id: z.string().min(1, "connection_id is required"),
+  schema: z.string().optional(),
+  table: z.string().optional(),
+  limit: z.number().int().min(1).max(100).default(50),
+  offset: z.number().int().min(0).default(0),
+  include_columns: z.boolean().default(true),
+  include_indexes: z.boolean().default(false),
+});
+
+export type InspectSchemaInput = z.infer<typeof InspectSchemaInputSchema>;
+
+export interface SchemaInspectionResult {
+  connection_id: string;
+  schema: string;
+  total_tables: number;
+  limit: number;
+  offset: number;
+  has_more: boolean;
+  tables: Array<{
+    name: string;
+    kind: "table" | "view" | "materialized_view";
+    comment?: string;
+    columns?: Array<{
+      name: string;
+      data_type: string;
+      is_nullable: boolean;
+      default_value?: string | null;
+      is_primary_key: boolean;
+      comment?: string;
+    }>;
+    indexes?: Array<{
+      name: string;
+      columns: string[];
+      is_unique: boolean;
+    }>;
+  }>;
 }
 
 /**
  * Inspects database schema, tables, views, and columns across supported engines
  * using the canonical 'agent-operations' profile.
  */
-export async function executeInspectSchema(
-  args: unknown,
-  context: McpConnectionContext,
-  opts?: InspectSchemaOptions,
-): Promise<McpCallResult> {
+async function inspectSchema(args: InspectSchemaInput, call: McpToolCall): Promise<CallToolResult> {
   const startedAt = Date.now();
   let parsedConnectionId: string | undefined;
-  const callerId = opts?.callerId || "anonymous";
+  const callerId = call.context.caller.username;
   const correlationId = randomUUID();
 
   try {
-    const parsed: InspectSchemaInput = InspectSchemaInputSchema.parse(args || {});
+    const parsed = args;
     parsedConnectionId = parsed.connection_id;
-    const provider = await context.getProvider(parsed.connection_id, "agent-operations");
+    const connection = await call.context.resolve(parsed.connection_id);
+    if (connection === null) throw new Error(`Connection not found: "${parsed.connection_id}"`);
+    const provider = await call.context.acquire(connection, "agent-operations");
 
     // 1. Determine target container (schema/catalog)
     const containers = await provider.listContainers();
@@ -202,4 +231,16 @@ export async function executeInspectSchema(
       ],
     };
   }
+}
+
+export function registerInspectSchema(server: McpServer, context: McpConnectionContext): void {
+  server.registerTool(
+    "inspect_schema",
+    {
+      description:
+        "Inspect catalog schemas, tables, columns, and indexes with pagination support across all supported databases.",
+      inputSchema: InspectSchemaInputSchema,
+    },
+    (args, ctx) => inspectSchema(args, { context, signal: ctx.mcpReq.signal }),
+  );
 }

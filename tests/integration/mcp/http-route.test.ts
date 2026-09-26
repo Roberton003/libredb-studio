@@ -1,666 +1,169 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
-import { Database } from "bun:sqlite";
-import { existsSync, mkdtempSync, rmSync, unlinkSync } from "fs";
+/**
+ * POST, GET and DELETE /api/mcp through the route module (#246), driven by the official SDK
+ * client in process.
+ *
+ * The route still admits a Studio session here, which this file provides by replacing
+ * getSession alone; every other export of @/lib/auth is the real one.
+ */
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createMockRequest, parseResponseJSON } from "../../helpers/mock-next";
+import * as realAuth from "@/lib/auth";
+import {
+  createDuckdbFile,
+  createSqliteFile,
+  gateMethod,
+  pinMcpTestEnvironment,
+  resetMcpTestState,
+  writeSeedFile,
+} from "../../helpers/mcp-fixtures";
+import { connectClient, legacyPost, readJsonRpc, routeServe } from "../../helpers/mcp-harness";
 
-const TEST_DIR = mkdtempSync(join(tmpdir(), "libredb-mcp-"));
-const TEST_DB_PATH = join(TEST_DIR, "test.db");
+pinMcpTestEnvironment();
 
-function setupTestDatabase() {
-  if (existsSync(TEST_DB_PATH)) {
+const mockGetSession = mock(async (): Promise<realAuth.UserPayload | null> => ({ username: "alice", role: "admin" }));
+mock.module("@/lib/auth", () => ({ ...realAuth, getSession: mockGetSession }));
+
+const route = await import("@/app/api/mcp/route");
+const { DuckDBProvider } = await import("@/lib/db/providers/sql/duckdb");
+const { getServerAuditBuffer } = await import("@/lib/audit");
+const serve = routeServe(route);
+const dir = mkdtempSync(join(tmpdir(), "libredb-mcp-route-"));
+
+beforeAll(async () => {
+  createSqliteFile(join(dir, "shop.db"), [
+    "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)",
+    "INSERT INTO users VALUES (1, 'Ada'), (2, 'Grace')",
+  ]);
+  await createDuckdbFile(join(dir, "slow.duckdb"), [
+    "CREATE TABLE answers (answer INTEGER)",
+    "INSERT INTO answers VALUES (42)",
+  ]);
+});
+
+beforeEach(() => {
+  mockGetSession.mockImplementation(async () => ({ username: "alice", role: "admin" }));
+  writeSeedFile(dir, [
+    { id: "shop", type: "sqlite", database: join(dir, "shop.db") },
+    { id: "slow", type: "duckdb", database: join(dir, "slow.duckdb") },
+  ]);
+});
+
+afterEach(async () => {
+  await resetMcpTestState();
+});
+
+afterAll(() => {
+  rmSync(dir, { recursive: true, force: true });
+});
+
+describe("a cancel sent in its own POST", () => {
+  test("does not stop the call it names, because the SDK serves every POST on a server of its own", async () => {
+    const gate = gateMethod(DuckDBProvider.prototype, "queryReadOnly");
     try {
-      unlinkSync(TEST_DB_PATH);
-    } catch {}
-  }
-  const db = new Database(TEST_DB_PATH, { create: true });
-  db.run("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)");
-  db.run("INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob')");
-  db.close();
-}
-
-async function cleanupTestDatabase() {
-  await McpConnectionContext.resetGlobalCache();
-  if (existsSync(TEST_DIR)) {
-    try {
-      rmSync(TEST_DIR, { recursive: true, force: true });
-    } catch {}
-  }
-}
-
-let mockSessionResult: { role: string; username: string } | null = { role: "admin", username: "admin" };
-let mockGetManagedConnectionsError: Error | null = null;
-
-const authModule = "@/lib/auth";
-mock.module(authModule, () => ({
-  getSession: mock(async () => mockSessionResult),
-}));
-
-mock.module("@/lib/seed", () => ({
-  getManagedConnections: mock(async () => {
-    if (mockGetManagedConnectionsError) {
-      throw mockGetManagedConnectionsError;
-    }
-    return [
-      {
-        id: "demo-pg",
-        name: "Demo Postgres",
-        type: "postgres",
-        database: "demo_db",
-        environment: "production",
-      },
-      {
-        id: "demo-sqlite",
-        name: "Demo SQLite",
-        type: "sqlite",
-        database: TEST_DB_PATH,
-        environment: "local",
-      },
-      {
-        id: "demo-sqlite-memory",
-        name: "Demo SQLite Memory",
-        type: "sqlite",
-        database: ":memory:",
-        environment: "local",
-      },
-    ];
-  }),
-}));
-
-import { GET, POST } from "@/app/api/mcp/route";
-import { McpConnectionContext } from "@/lib/mcp/context";
-import { McpDispatcher } from "@/lib/mcp/dispatcher";
-import { logger } from "@/lib/logger";
-import { getServerAuditBuffer } from "@/lib/audit";
-import { consumeRateLimit, clearRateLimitState } from "@/lib/api/rate-limit";
-
-describe("MCP Next.js Route Integration (/api/mcp)", () => {
-  beforeAll(() => {
-    setupTestDatabase();
-  });
-
-  afterAll(async () => {
-    await cleanupTestDatabase();
-  });
-
-  beforeEach(async () => {
-    mockSessionResult = { role: "admin", username: "admin" };
-    mockGetManagedConnectionsError = null;
-    await McpConnectionContext.resetGlobalCache();
-    getServerAuditBuffer().clear();
-    clearRateLimitState();
-  });
-
-  test("GET /api/mcp responds 200 with MCP protocol metadata", async () => {
-    const response = await GET();
-    expect(response.status).toBe(200);
-
-    const body = await parseResponseJSON<any>(response);
-    expect(body.status).toBe("ok");
-    expect(body.protocol).toBe("mcp");
-    expect(body.protocolVersion).toBe("2024-11-05");
-    expect(body.server).toBe("libredb-studio-mcp");
-  });
-
-  test("POST /api/mcp rejects unauthenticated request with status 401 from guardRoute", async () => {
-    mockSessionResult = null;
-    const req = createMockRequest("/api/mcp", {
-      method: "POST",
-      body: { jsonrpc: "2.0", id: 1, method: "tools/list" },
-    });
-
-    const response = await POST(req as any);
-    expect(response.status).toBe(401);
-
-    const body = await parseResponseJSON<any>(response);
-    expect(body.error).toBe("Authentication required");
-  });
-
-  test("POST /api/mcp ignores external token headers and requires valid LibreDB session", async () => {
-    mockSessionResult = null;
-
-    const req = createMockRequest("/api/mcp", {
-      method: "POST",
-      headers: {
-        "x-libredb-mcp-token": "arbitrary-token",
-        Authorization: "Bearer arbitrary-token",
-      },
-      body: { jsonrpc: "2.0", id: 10, method: "ping" },
-    });
-
-    const response = await POST(req as any);
-    expect(response.status).toBe(401);
-
-    const body = await parseResponseJSON<any>(response);
-    expect(body.error).toBe("Authentication required");
-  });
-
-  test("POST /api/mcp accepts request with authenticated user session", async () => {
-    mockSessionResult = { role: "user", username: "regular_user" };
-
-    const req = createMockRequest("/api/mcp", {
-      method: "POST",
-      body: { jsonrpc: "2.0", id: 11, method: "ping" },
-    });
-
-    const response = await POST(req as any);
-    expect(response.status).toBe(200);
-
-    const body = await parseResponseJSON<any>(response);
-    expect(body.id).toBe(11);
-    expect(body.result).toEqual({});
-  });
-
-  test("POST /api/mcp executes 'initialize' handshake successfully", async () => {
-    const req = createMockRequest("/api/mcp", {
-      method: "POST",
-      body: {
-        jsonrpc: "2.0",
-        id: "init-1",
-        method: "initialize",
-        params: {
-          protocolVersion: "2024-11-05",
-          clientInfo: { name: "cursor", version: "0.45.0" },
-        },
-      },
-    });
-
-    const response = await POST(req as any);
-    expect(response.status).toBe(200);
-
-    const body = await parseResponseJSON<any>(response);
-    expect(body.id).toBe("init-1");
-    expect(body.result.protocolVersion).toBe("2024-11-05");
-    expect(body.result.serverInfo.name).toBe("libredb-studio-mcp");
-  });
-
-  test("POST /api/mcp lists tools with 'tools/list'", async () => {
-    const req = createMockRequest("/api/mcp", {
-      method: "POST",
-      body: {
-        jsonrpc: "2.0",
-        id: "tools-list-req",
-        method: "tools/list",
-      },
-    });
-
-    const response = await POST(req as any);
-    expect(response.status).toBe(200);
-
-    const body = await parseResponseJSON<any>(response);
-    expect(body.result.tools).toBeArray();
-    expect(body.result.tools.length).toBe(3);
-  });
-
-  test("POST /api/mcp executes 'tools/call' for 'list_connections'", async () => {
-    const req = createMockRequest("/api/mcp", {
-      method: "POST",
-      body: {
-        jsonrpc: "2.0",
-        id: "call-1",
-        method: "tools/call",
-        params: {
-          name: "list_connections",
-          arguments: {},
-        },
-      },
-    });
-
-    const response = await POST(req as any);
-    expect(response.status).toBe(200);
-
-    const body = await parseResponseJSON<any>(response);
-    expect(body.result.content).toBeArray();
-
-    const data = JSON.parse(body.result.content[0].text);
-    expect(data.length).toBe(3);
-    expect(data.some((c: any) => c.id === "demo-pg")).toBe(true);
-    expect(data.some((c: any) => c.id === "demo-sqlite")).toBe(true);
-  });
-
-  test("POST /api/mcp executes 'tools/call' for 'run_read_query' successfully with pagination", async () => {
-    const req = createMockRequest("/api/mcp", {
-      method: "POST",
-      body: {
-        jsonrpc: "2.0",
-        id: "call-query-1",
-        method: "tools/call",
-        params: {
-          name: "run_read_query",
-          arguments: {
-            connection_id: "demo-sqlite",
-            sql: "SELECT 2026 AS year, 'MCP' AS protocol",
+      const call = serve(
+        legacyPost({
+          jsonrpc: "2.0",
+          id: 7,
+          method: "tools/call",
+          params: {
+            name: "run_read_query",
+            arguments: { connection_id: "seed:slow", sql: "SELECT answer FROM answers" },
           },
-        },
-      },
-    });
+        }),
+      );
+      await gate.entered;
+      const cancel = await serve(
+        legacyPost({
+          jsonrpc: "2.0",
+          method: "notifications/cancelled",
+          params: { requestId: 7, reason: "stopped by the test" },
+        }),
+      );
+      expect(cancel.status).toBe(202);
 
-    const response = await POST(req as any);
-    expect(response.status).toBe(200);
-
-    const body = await parseResponseJSON<any>(response);
-    expect(body.result.isError).toBeFalsy();
-    expect(body.result.content).toBeArray();
-
-    const data = JSON.parse(body.result.content[0].text);
-    expect(data.connection_id).toBe("demo-sqlite");
-    expect(data.row_count).toBe(1);
-    expect(data.rows[0].year).toBe(2026);
-    expect(data.rows[0].protocol).toBe("MCP");
-    expect(data.pagination).toBeDefined();
-    expect(data.pagination.limit).toBe(100);
-    expect(data.pagination.hasMore).toBe(false);
-  });
-
-  test("POST /api/mcp refuses profile for SQLite :memory: without fallback to writable provider", async () => {
-    const req = createMockRequest("/api/mcp", {
-      method: "POST",
-      body: {
-        jsonrpc: "2.0",
-        id: "refuse-memory-1",
-        method: "tools/call",
-        params: {
-          name: "run_read_query",
-          arguments: {
-            connection_id: "demo-sqlite-memory",
-            sql: "SELECT 1",
-          },
-        },
-      },
-    });
-
-    const response = await POST(req as any);
-    expect(response.status).toBe(200);
-
-    const body = await parseResponseJSON<any>(response);
-    expect(body.result.isError).toBe(true);
-    expect(body.result.content[0].text).toContain("cannot target an in-memory SQLite database");
-  });
-
-  test("POST /api/mcp refuses inspect_schema on SQLite :memory: without fallback", async () => {
-    const req = createMockRequest("/api/mcp", {
-      method: "POST",
-      body: {
-        jsonrpc: "2.0",
-        id: "refuse-inspect-1",
-        method: "tools/call",
-        params: {
-          name: "inspect_schema",
-          arguments: {
-            connection_id: "demo-sqlite-memory",
-          },
-        },
-      },
-    });
-
-    const response = await POST(req as any);
-    expect(response.status).toBe(200);
-
-    const body = await parseResponseJSON<any>(response);
-    expect(body.result.isError).toBe(true);
-    expect(body.result.content[0].text).toContain("cannot target an in-memory SQLite database");
-  });
-
-  test("POST /api/mcp rejects destructive statement in 'run_read_query' with isError: true", async () => {
-    const req = createMockRequest("/api/mcp", {
-      method: "POST",
-      body: {
-        jsonrpc: "2.0",
-        id: "call-drop-1",
-        method: "tools/call",
-        params: {
-          name: "run_read_query",
-          arguments: {
-            connection_id: "demo-sqlite",
-            sql: "DROP TABLE users",
-          },
-        },
-      },
-    });
-
-    const response = await POST(req as any);
-    expect(response.status).toBe(200);
-
-    const body = await parseResponseJSON<any>(response);
-    expect(body.result.isError).toBe(true);
-    expect(body.result.content[0].text).toContain("MCP execution fence rejected");
-  });
-
-  test("POST /api/mcp executes 'tools/call' for 'inspect_schema'", async () => {
-    const req = createMockRequest("/api/mcp", {
-      method: "POST",
-      body: {
-        jsonrpc: "2.0",
-        id: "call-schema-1",
-        method: "tools/call",
-        params: {
-          name: "inspect_schema",
-          arguments: {
-            connection_id: "demo-sqlite",
-          },
-        },
-      },
-    });
-
-    const response = await POST(req as any);
-    expect(response.status).toBe(200);
-
-    const body = await parseResponseJSON<any>(response);
-    expect(body.result.isError).toBeFalsy();
-    expect(body.result.content).toBeArray();
-
-    const data = JSON.parse(body.result.content[0].text);
-    expect(data.connection_id).toBe("demo-sqlite");
-    expect(data.tables).toBeArray();
-  });
-
-  test("POST /api/mcp responds 204 for notifications without body", async () => {
-    const req = createMockRequest("/api/mcp", {
-      method: "POST",
-      body: {
-        jsonrpc: "2.0",
-        method: "notifications/initialized",
-      },
-    });
-
-    const response = await POST(req as any);
-    expect(response.status).toBe(204);
-  });
-
-  test("POST /api/mcp cancels cross-request query via notifications/cancelled notification", async () => {
-    const mockAsyncProvider = {
-      readOnlyProfile: true,
-      prepareQuery: (sql: string, opts: any) => ({ query: sql, limit: opts.limit, offset: 0, wasLimited: false }),
-      queryReadOnly: async () => {
-        await new Promise((resolve) => setTimeout(resolve, 500));
-        return { rows: [{ val: 1 }], fields: ["val"] };
-      },
-    };
-
-    McpConnectionContext.setCachedProvider("demo-sqlite", "agent-read-only", mockAsyncProvider as any);
-
-    // Fire POST 1 with long-running query
-    const req1 = createMockRequest("/api/mcp", {
-      method: "POST",
-      body: {
-        jsonrpc: "2.0",
-        id: "slow-query-1",
-        method: "tools/call",
-        params: {
-          name: "run_read_query",
-          arguments: {
-            connection_id: "demo-sqlite",
-            sql: "SELECT 1",
-            timeout_ms: 10000,
-          },
-        },
-      },
-    });
-
-    const promise1 = POST(req1 as any);
-
-    // Wait 20ms to ensure query started in provider
-    await new Promise((r) => setTimeout(r, 20));
-
-    // Fire POST 2 with cancellation notification for requestId "slow-query-1"
-    const req2 = createMockRequest("/api/mcp", {
-      method: "POST",
-      body: {
-        jsonrpc: "2.0",
-        method: "notifications/cancelled",
-        params: {
-          requestId: "slow-query-1",
-          reason: "User cancelled query via UI/MCP",
-        },
-      },
-    });
-
-    const response2 = await POST(req2 as any);
-    expect(response2.status).toBe(204);
-
-    const response1 = await promise1;
-    expect(response1.status).toBe(200);
-
-    const body1 = await parseResponseJSON<any>(response1);
-    expect(body1.result.isError).toBe(true);
-    expect(body1.result.content[0].text).toContain("cancelled");
-  });
-
-  test("POST /api/mcp responds 400 on invalid or malformed JSON", async () => {
-    const brokenReq = {
-      method: "POST",
-      headers: new Headers(),
-      json: async () => {
-        throw new Error("Unexpected token at position 0");
-      },
-    };
-    const response = await POST(brokenReq as any);
-    expect(response.status).toBe(400);
-    const body = await parseResponseJSON<any>(response);
-    expect(body.error).toBeDefined();
-    expect(body.error.code).toBe(-32700);
-    expect(body.error.message).toContain("Parse error");
-  });
-
-  test("POST /api/mcp catches error in getManagedConnections and proceeds with empty connections", async () => {
-    const secret = "synthetic_managed_connection_secret";
-    mockGetManagedConnectionsError = new Error(`Simulated managed connections failure: password=${secret}`);
-    const warnings: Array<{ message: string; context: any }> = [];
-    const warnSpy = spyOn(logger, "warn").mockImplementation((message, context) => {
-      warnings.push({ message, context });
-    });
-    const req = createMockRequest("/api/mcp", {
-      method: "POST",
-      body: { jsonrpc: "2.0", id: "ping-fallback", method: "ping" },
-    });
-    try {
-      const response = await POST(req as any);
-      expect(response.status).toBe(200);
-      const body = await parseResponseJSON<any>(response);
-      expect(body.id).toBe("ping-fallback");
-      expect(warnings).toHaveLength(1);
-      expect(warnings[0].message).toBe("Could not load managed connections for MCP session");
-      expect(warnings[0].context.role).toBe("admin");
-      expect(warnings[0].context.error).toBeInstanceOf(Error);
-      expect(warnings[0].context.error).not.toBe(mockGetManagedConnectionsError);
-      expect(warnings[0].context.error.message).toContain("password=[REDACTED]");
-      expect(warnings[0].context.error.message).not.toContain(secret);
-      expect(warnings[0].context.error.stack ?? "").not.toContain(secret);
+      gate.release();
+      const reply = await readJsonRpc(await call);
+      expect(reply.result?.isError ?? false).toBe(false);
+      expect(JSON.stringify(reply.result?.content)).toContain("42");
     } finally {
-      warnSpy.mockRestore();
+      gate.release();
+      // The held statement runs to its end before afterEach closes the provider under it.
+      await gate.finished;
+      gate.restore();
+    }
+  });
+});
+
+describe("a client pinned to revision 2026-07-28", () => {
+  test("discovers the server, connects in the modern era and calls a tool", async () => {
+    const session = await connectClient(serve, { negotiation: "pinned" });
+    try {
+      expect(session.client.getProtocolEra()).toBe("modern");
+      const result = await session.client.callTool({ name: "list_connections", arguments: {} });
+      expect(JSON.stringify(result.content)).toContain("seed:shop");
+    } finally {
+      await session.close();
+    }
+  });
+});
+
+describe("the route in front of the SDK", () => {
+  test("lets the default client connect and list the three tools", async () => {
+    const session = await connectClient(serve);
+    try {
+      expect((await session.client.listTools()).tools.map((tool) => tool.name)).toEqual([
+        "list_connections",
+        "inspect_schema",
+        "run_read_query",
+      ]);
+    } finally {
+      await session.close();
     }
   });
 
-  test("POST /api/mcp responds 500 when unhandled error occurs in dispatcher", async () => {
-    const originalHandle = McpDispatcher.prototype.handle;
-    McpDispatcher.prototype.handle = async () => {
-      throw new Error("Dispatcher fatal explosion");
-    };
+  test.each(["GET", "DELETE"])("answers %s with the SDK's 405 and Allow: POST", async (method) => {
+    const response = await serve(
+      new Request("http://localhost:3000/api/mcp", { method, headers: { host: "localhost:3000" } }),
+    );
+    expect(response.status).toBe(405);
+    expect(response.headers.get("allow")).toBe("POST");
+    expect(await response.json()).toEqual({
+      jsonrpc: "2.0",
+      error: { code: -32000, message: "Method not allowed." },
+      id: null,
+    });
+  });
 
+  test("answers a legacy notification with 202, not 204", async () => {
+    const response = await serve(legacyPost({ jsonrpc: "2.0", method: "notifications/initialized" }));
+    expect(response.status).toBe(202);
+  });
+
+  test("keeps guardRoute's 401 for a POST without a session at this stage", async () => {
+    mockGetSession.mockImplementation(async () => null);
+    const response = await serve(legacyPost({ jsonrpc: "2.0", id: 1, method: "tools/list" }));
+    expect(response.status).toBe(401);
+    expect(await response.json()).toEqual({ error: "Authentication required" });
+  });
+
+  test("hands the session's user to the tools as their caller", async () => {
+    const session = await connectClient(serve);
     try {
-      const req = createMockRequest("/api/mcp", {
-        method: "POST",
-        body: { jsonrpc: "2.0", id: "crash-1", method: "ping" },
+      await session.client.callTool({
+        name: "run_read_query",
+        arguments: { connection_id: "seed:shop", sql: "SELECT id FROM users" },
       });
-      const response = await POST(req as any);
-      expect(response.status).toBe(500);
-      const body = await parseResponseJSON<any>(response);
-      expect(body.error).toBeDefined();
-      expect(body.error.code).toBe(-32603);
-      expect(body.error.message).toBe("Dispatcher fatal explosion");
+      const users = getServerAuditBuffer()
+        .getAll()
+        .filter((event) => event.action === "run_read_query")
+        .map((event) => event.user);
+      // At least one event, and every one names the caller, however many events the tool writes
+      // for one call.
+      expect([...new Set(users)]).toEqual(["alice"]);
     } finally {
-      McpDispatcher.prototype.handle = originalHandle;
+      await session.close();
     }
-  });
-
-  test("POST /api/mcp emits audit event when run_read_query reaches engine", async () => {
-    getServerAuditBuffer().clear();
-
-    const req = createMockRequest("/api/mcp", {
-      method: "POST",
-      body: {
-        jsonrpc: "2.0",
-        id: "audit-query-1",
-        method: "tools/call",
-        params: {
-          name: "run_read_query",
-          arguments: {
-            connection_id: "demo-sqlite",
-            sql: "SELECT 100 AS num",
-          },
-        },
-      },
-    });
-
-    const response = await POST(req as any);
-    expect(response.status).toBe(200);
-
-    const auditEvents = getServerAuditBuffer().filter({ type: "agent_operation" });
-    expect(auditEvents.length).toBeGreaterThan(0);
-    const queryEvent = auditEvents.find((e) => e.action === "run_read_query" && e.target === "demo-sqlite");
-    expect(queryEvent).toBeDefined();
-    expect(queryEvent?.user).toBe("admin");
-    expect(queryEvent?.result).toBe("success");
-    expect(queryEvent?.duration).toBeDefined();
-    expect(queryEvent?.correlationId).toBeDefined();
-    expect(queryEvent?.correlationId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
-  });
-
-  test("POST /api/mcp emits audit event when inspect_schema reaches engine", async () => {
-    getServerAuditBuffer().clear();
-
-    const req = createMockRequest("/api/mcp", {
-      method: "POST",
-      body: {
-        jsonrpc: "2.0",
-        id: "audit-schema-1",
-        method: "tools/call",
-        params: {
-          name: "inspect_schema",
-          arguments: {
-            connection_id: "demo-sqlite",
-          },
-        },
-      },
-    });
-
-    const response = await POST(req as any);
-    expect(response.status).toBe(200);
-
-    const auditEvents = getServerAuditBuffer().filter({ type: "agent_operation" });
-    expect(auditEvents.length).toBeGreaterThan(0);
-    const schemaEvent = auditEvents.find((e) => e.action === "inspect_schema" && e.target === "demo-sqlite");
-    expect(schemaEvent).toBeDefined();
-    expect(schemaEvent?.user).toBe("admin");
-    expect(schemaEvent?.result).toBe("success");
-    expect(schemaEvent?.duration).toBeDefined();
-    expect(schemaEvent?.correlationId).toBeDefined();
-    expect(schemaEvent?.correlationId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
-  });
-
-  test("POST /api/mcp gives two calls that reuse one JSON-RPC id distinct audit correlation ids", async () => {
-    const calls = [
-      { name: "run_read_query", arguments: { connection_id: "demo-sqlite", sql: "SELECT 1 AS one" } },
-      { name: "inspect_schema", arguments: { connection_id: "demo-sqlite" } },
-    ];
-
-    for (const params of calls) {
-      getServerAuditBuffer().clear();
-
-      for (let i = 0; i < 2; i++) {
-        const req = createMockRequest("/api/mcp", {
-          method: "POST",
-          body: { jsonrpc: "2.0", id: 1, method: "tools/call", params },
-        });
-        const response = await POST(req as any);
-        expect(response.status).toBe(200);
-      }
-
-      const correlationIds = getServerAuditBuffer()
-        .filter({ type: "agent_operation" })
-        .filter((e) => e.action === params.name && e.target === "demo-sqlite")
-        .map((e) => e.correlationId);
-      expect(correlationIds).toHaveLength(2);
-      expect(correlationIds.every((id) => typeof id === "string")).toBe(true);
-      expect(new Set(correlationIds).size).toBe(2);
-    }
-  });
-
-  test("POST /api/mcp meters batch database calls against query bucket and throttles with 429 when exhausted", async () => {
-    clearRateLimitState();
-    getServerAuditBuffer().clear();
-
-    // Consume 119 out of 120 slots on query bucket for "admin"
-    for (let i = 0; i < 119; i++) {
-      consumeRateLimit("query", "admin");
-    }
-
-    // Now 1 slot remains. Send a batch with 2 database queries:
-    // 1st query uses the last slot, 2nd query exceeds query budget -> 429
-    const req = createMockRequest("/api/mcp", {
-      method: "POST",
-      body: [
-        {
-          jsonrpc: "2.0",
-          id: "batch-query-1",
-          method: "tools/call",
-          params: {
-            name: "run_read_query",
-            arguments: { connection_id: "demo-sqlite", sql: "SELECT 1" },
-          },
-        },
-        {
-          jsonrpc: "2.0",
-          id: "batch-query-2",
-          method: "tools/call",
-          params: {
-            name: "run_read_query",
-            arguments: { connection_id: "demo-sqlite", sql: "SELECT 2" },
-          },
-        },
-      ],
-    });
-
-    const response = await POST(req as any);
-    expect(response.status).toBe(429);
-
-    const throttledEvents = getServerAuditBuffer().filter({ type: "rate_limit_exceeded" });
-    expect(throttledEvents.length).toBeGreaterThan(0);
-    expect(throttledEvents[0].bucket).toBe("query");
-    expect(throttledEvents[0].user).toBe("admin");
-  });
-
-  test("POST /api/mcp allows batch database calls when within rate limit budget", async () => {
-    clearRateLimitState();
-    const req = createMockRequest("/api/mcp", {
-      method: "POST",
-      body: [
-        {
-          jsonrpc: "2.0",
-          id: "batch-allowed-1",
-          method: "tools/call",
-          params: {
-            name: "run_read_query",
-            arguments: { connection_id: "demo-sqlite", sql: "SELECT 1" },
-          },
-        },
-        {
-          jsonrpc: "2.0",
-          id: "batch-allowed-2",
-          method: "tools/call",
-          params: {
-            name: "run_read_query",
-            arguments: { connection_id: "demo-sqlite", sql: "SELECT 2" },
-          },
-        },
-      ],
-    });
-
-    const response = await POST(req as any);
-    expect(response.status).toBe(200);
-    const data = await response.json();
-    expect(Array.isArray(data)).toBe(true);
-    expect(data.length).toBe(2);
   });
 });

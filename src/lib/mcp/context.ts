@@ -1,155 +1,83 @@
-import type { DatabaseConnection } from "@/lib/types";
+import type { AuthInfo } from "@modelcontextprotocol/server";
+import type { Role } from "@/lib/auth";
+import { acquireExecutionProfileProvider, profiledCacheKey, type ExecutionProfile } from "@/lib/db/factory";
 import type { DatabaseProvider } from "@/lib/db/types";
-import {
-  acquireExecutionProfileProvider,
-  getOrCreateProvider,
-  clearProviderCache,
-  type ExecutionProfile,
-} from "@/lib/db/factory";
-import type { PublicConnectionMetadata } from "./types";
 import { logger } from "@/lib/logger";
+import { getManagedConnections, type ManagedConnection } from "@/lib/seed";
 import { redactError } from "./serializer";
 
+/**
+ * The MCP tools' view of the connections one caller may use (#246).
+ *
+ * One instance per request, built by the SDK server factory around the verified identity. The
+ * seed file is read lazily by the first tool that needs it, so initialize, server/discover and
+ * tools/list never depend on it, and within one request it is read once.
+ *
+ * Acquisition goes through acquireExecutionProfileProvider and nothing else. Concurrent first
+ * acquisitions of one connection and profile are joined here, keyed on the factory's own
+ * profiledCacheKey, because a second derivation of that key would reopen the divergence
+ * GHSA-3wh2-8x78-jfw4 closed (src/lib/db/provider-cache-key.ts). After the key is awaited, the
+ * lookup and the insertion happen in one synchronous step, and a settled acquisition leaves the
+ * map, so a failed one is retried by the next caller.
+ */
+
+export interface McpCaller {
+  readonly username: string;
+  readonly role: Role;
+}
+
+export interface McpToolCall {
+  readonly context: McpConnectionContext;
+  readonly signal: AbortSignal;
+}
+
+/** The identity the verifier put on the token, and an explicit error when it is not there. */
+export function mcpCaller(authInfo: AuthInfo): McpCaller {
+  const username = authInfo.extra?.username;
+  const role = authInfo.extra?.role;
+  if (typeof username !== "string" || username === "" || (role !== "admin" && role !== "user")) {
+    throw new Error("The verified MCP identity carries no username and role");
+  }
+  return { username, role };
+}
+
+const pendingAcquisitions = new Map<string, Promise<DatabaseProvider>>();
+
 export class McpConnectionContext {
-  private connections = new Map<string, DatabaseConnection>();
-  private static testMockProviders = new Map<string, DatabaseProvider>();
-  private static pendingAcquisitions = new Map<string, Promise<DatabaseProvider>>();
+  private visible: Promise<readonly ManagedConnection[]> | null = null;
 
-  private static getCacheKey(connectionId: string, profile?: ExecutionProfile): string {
-    return JSON.stringify([connectionId, profile ?? null]);
+  constructor(readonly caller: McpCaller) {}
+
+  visibleConnections(): Promise<readonly ManagedConnection[]> {
+    this.visible ??= this.load();
+    return this.visible;
   }
 
-  constructor(initialConnections: DatabaseConnection[] = []) {
-    for (const conn of initialConnections) {
-      this.registerConnection(conn);
-    }
+  async resolve(connectionId: string): Promise<ManagedConnection | null> {
+    return (await this.visibleConnections()).find((connection) => connection.id === connectionId) ?? null;
   }
 
-  /**
-   * Registers or updates an available connection configuration internally.
-   */
-  public registerConnection(connection: DatabaseConnection): void {
-    this.connections.set(connection.id, connection);
+  async acquire(connection: ManagedConnection, profile: ExecutionProfile): Promise<DatabaseProvider> {
+    const key = await profiledCacheKey(connection, profile);
+    const pending = pendingAcquisitions.get(key);
+    if (pending !== undefined) return pending;
+    const acquisition = acquireExecutionProfileProvider(connection, profile).finally(() => {
+      pendingAcquisitions.delete(key);
+    });
+    pendingAcquisitions.set(key, acquisition);
+    return acquisition;
   }
 
-  /**
-   * Returns a sanitized list of public connections without credentials (zero-leakage).
-   */
-  public listPublicConnections(environment = "all"): PublicConnectionMetadata[] {
-    const list: PublicConnectionMetadata[] = [];
-    for (const conn of this.connections.values()) {
-      if (environment !== "all") {
-        if (!conn.environment || conn.environment !== environment) {
-          continue;
-        }
-      }
-      list.push({
-        id: conn.id,
-        name: conn.name,
-        engine: conn.type,
-        database: conn.database,
-        read_only: conn.environment === "production" || (conn as any).readOnly === true,
-        environment: conn.environment,
+  private async load(): Promise<readonly ManagedConnection[]> {
+    try {
+      return await getManagedConnections([this.caller.role]);
+    } catch (error) {
+      // The pre-SDK route's behaviour, kept until an unreadable seed file becomes an explicit answer.
+      logger.warn("Could not load managed connections for MCP", {
+        role: this.caller.role,
+        error: redactError(error).message,
       });
+      return [];
     }
-    return list;
-  }
-
-  /**
-   * Returns raw connection configuration (for internal factory use only).
-   */
-  public getConnection(id: string): DatabaseConnection | undefined {
-    return this.connections.get(id);
-  }
-
-  /**
-   * Acquires a database provider via the canonical factory (acquireExecutionProfileProvider or getOrCreateProvider).
-   * Uses a static single-flight promise map to avoid redundant concurrent connection attempts for the same target.
-   */
-  public async getProvider(connectionId: string, profile?: ExecutionProfile): Promise<DatabaseProvider> {
-    const connection = this.connections.get(connectionId);
-    if (!connection) {
-      throw new Error(`Connection not found: "${connectionId}"`);
-    }
-
-    const cacheKey = McpConnectionContext.getCacheKey(connectionId, profile);
-
-    // 1. Check unit test mock seam
-    const mock = McpConnectionContext.testMockProviders.get(cacheKey);
-    if (mock) {
-      if (!mock.isConnected || mock.isConnected()) {
-        return mock;
-      }
-      McpConnectionContext.testMockProviders.delete(cacheKey);
-    }
-
-    // 2. Single-flight acquisition mutex
-    const inFlight = McpConnectionContext.pendingAcquisitions.get(cacheKey);
-    if (inFlight) {
-      return inFlight;
-    }
-
-    const acquisitionPromise = (async () => {
-      try {
-        if (profile) {
-          return await acquireExecutionProfileProvider(connection, profile);
-        }
-        return await getOrCreateProvider(connection);
-      } finally {
-        McpConnectionContext.pendingAcquisitions.delete(cacheKey);
-      }
-    })();
-
-    McpConnectionContext.pendingAcquisitions.set(cacheKey, acquisitionPromise);
-    return acquisitionPromise;
-  }
-
-  /**
-   * Disconnects all active providers and resets provider caches.
-   */
-  public static async disconnectActiveProviders(): Promise<void> {
-    const disconnectPromises: Promise<void>[] = [];
-
-    for (const [key, provider] of McpConnectionContext.testMockProviders.entries()) {
-      if (typeof provider.disconnect === "function") {
-        disconnectPromises.push(
-          provider.disconnect().catch((err) => {
-            logger.warn(`Error disconnecting provider during MCP shutdown`, { key, error: redactError(err) });
-          }),
-        );
-      }
-    }
-    McpConnectionContext.testMockProviders.clear();
-    McpConnectionContext.pendingAcquisitions.clear();
-
-    await Promise.all(disconnectPromises);
-    await clearProviderCache();
-  }
-
-  public async disconnectAll(): Promise<void> {
-    return McpConnectionContext.disconnectActiveProviders();
-  }
-
-  /**
-   * Test seam for injecting mocked database providers during isolated unit tests.
-   */
-  public static setCachedProvider(
-    connectionId: string,
-    profile: ExecutionProfile | undefined,
-    provider: DatabaseProvider,
-  ): void {
-    const key = McpConnectionContext.getCacheKey(connectionId, profile);
-    McpConnectionContext.testMockProviders.set(key, provider);
-  }
-
-  public static async resetGlobalCache(): Promise<void> {
-    await McpConnectionContext.disconnectActiveProviders();
-  }
-
-  /**
-   * Convenience alias for disconnectAll.
-   */
-  public async closeAll(): Promise<void> {
-    return this.disconnectAll();
   }
 }
